@@ -17,10 +17,28 @@ use thiserror::Error;
 const MAX_DECOMPRESSED_BYTES: usize = 256 * 1024 * 1024;
 /// Minimum pixel dimension; images strictly smaller in width or height are skipped (icons/artifacts).
 const MIN_IMAGE_DIMENSION: u32 = 50;
-/// 2.0 MiB threshold used for upload limit warnings.
-pub const TWO_MB_BINARY_BYTES: usize = 2 * 1024 * 1024;
-/// 2.0 MB decimal threshold (2,000,000 bytes).
-pub const TWO_MB_DECIMAL_BYTES: usize = 2_000_000;
+/// Binary MiB divisor used consistently for MB readouts and target-size limits.
+pub const BYTES_PER_MB: f64 = 1024.0 * 1024.0;
+/// Pixel cap used when sample-compressing a single representative image during PDF load.
+const MAX_CALIBRATION_PIXELS: u64 = 1_000_000;
+/// Ratio of grayscale to RGB bits-per-pixel for JPEG and Flate streams.
+const GRAY_TO_RGB_JPEG_RATIO: f64 = 0.72;
+const GRAY_TO_RGB_FLATE_RATIO: f64 = 0.42;
+/// Fallback bits-per-pixel defaults if no image could be sample-calibrated on load.
+const DEFAULT_RGB_JPEG_Q50_BPP: f64 = 1.05;
+const DEFAULT_RGB_FLATE_BPP: f64 = 8.50;
+
+pub fn bytes_to_mb(bytes: usize) -> f64 {
+    (bytes as f64) / BYTES_PER_MB
+}
+
+pub fn mb_to_bytes(mb: f64) -> usize {
+    if mb <= 0.0 || !mb.is_finite() {
+        0
+    } else {
+        (mb * BYTES_PER_MB).round() as usize
+    }
+}
 
 #[derive(Debug, Error)]
 pub enum PdfError {
@@ -129,7 +147,183 @@ impl Default for CompressionOptions {
 pub struct PdfSummary {
     pub page_count: usize,
     pub image_count: usize,
+    pub compressible_image_count: usize,
     pub file_bytes: usize,
+    pub non_image_overhead_bytes: usize,
+    pub compressible_rgb_pixels: u64,
+    pub compressible_gray_pixels: u64,
+    pub orig_dct_image_count: usize,
+    pub orig_dct_bytes: usize,
+    pub orig_dct_rgb_pixels: u64,
+    pub orig_dct_gray_pixels: u64,
+    pub sample_rgb_jpeg_q50_bpp: f64,
+    pub sample_rgb_flate_bpp: f64,
+}
+
+impl PdfSummary {
+    /// Estimates the compressed PDF size in bytes using O(1) pure arithmetic from load-time
+    /// inspection metrics and optional single-image calibration, keeping UI slider drags instant.
+    pub fn estimate_compressed_bytes(&self, options: &CompressionOptions) -> usize {
+        self.estimate_compressed_bytes_impl(options, true)
+    }
+
+    fn estimate_compressed_bytes_impl(
+        &self,
+        options: &CompressionOptions,
+        apply_orig_dct_cap: bool,
+    ) -> usize {
+        if self.compressible_image_count == 0 {
+            return self.file_bytes;
+        }
+
+        let scale = (options.scale as f64).clamp(0.10, 1.00);
+        let scale_sq = scale * scale;
+        let quality = (options.quality.clamp(1, 100)) as f64;
+        // Keep filter multiplier smooth in (1.0 - scale) so est(scale) remains strictly monotone.
+        let filter_mult = if options.resize_filter == ResizeFilterChoice::Lanczos3 {
+            1.00 + 0.03 * (1.0 - scale)
+        } else {
+            1.00
+        };
+
+        let est_image_bytes = match options.format {
+            ImageFormatChoice::Jpeg => {
+                let bpp = self.sample_rgb_jpeg_q50_bpp * jpeg_quality_multiplier(quality) * filter_mult;
+                let non_dct_count = self
+                    .compressible_image_count
+                    .saturating_sub(self.orig_dct_image_count) as f64;
+                let non_dct_rgb = self
+                    .compressible_rgb_pixels
+                    .saturating_sub(self.orig_dct_rgb_pixels) as f64;
+                let non_dct_gray = self
+                    .compressible_gray_pixels
+                    .saturating_sub(self.orig_dct_gray_pixels) as f64;
+                let non_dct_eff = non_dct_rgb + GRAY_TO_RGB_JPEG_RATIO * non_dct_gray;
+                let non_dct_est = (non_dct_eff * scale_sq * bpp) / 8.0 + non_dct_count * 620.0;
+
+                let dct_eff = (self.orig_dct_rgb_pixels as f64)
+                    + GRAY_TO_RGB_JPEG_RATIO * (self.orig_dct_gray_pixels as f64);
+                let mut dct_est = (dct_eff * scale_sq * bpp) / 8.0
+                    + (self.orig_dct_image_count as f64) * 620.0;
+                if apply_orig_dct_cap && (scale - 1.0).abs() < 1e-4 && self.orig_dct_image_count > 0 {
+                    dct_est = dct_est.min(self.orig_dct_bytes as f64);
+                }
+
+                non_dct_est + dct_est
+            }
+            ImageFormatChoice::Avif => {
+                // AVIF pipeline encodes via ravif for stats and writes RGB /DCTDecode into the PDF.
+                let bpp = self.sample_rgb_jpeg_q50_bpp * jpeg_quality_multiplier(quality) * filter_mult;
+                let eff_pixels = (self.compressible_rgb_pixels + self.compressible_gray_pixels) as f64;
+                (eff_pixels * scale_sq * bpp) / 8.0 + (self.compressible_image_count as f64) * 620.0
+            }
+            ImageFormatChoice::Png => {
+                let bpp = self.sample_rgb_flate_bpp * filter_mult;
+                let eff_pixels = (self.compressible_rgb_pixels as f64)
+                    + GRAY_TO_RGB_FLATE_RATIO * (self.compressible_gray_pixels as f64);
+                (eff_pixels * scale_sq * bpp) / 8.0 + (self.compressible_image_count as f64) * 64.0
+            }
+            ImageFormatChoice::Webp => {
+                // WebP pipeline converts to RGB and writes lossless PDF /FlateDecode streams.
+                let bpp = self.sample_rgb_flate_bpp * filter_mult;
+                let eff_pixels = (self.compressible_rgb_pixels + self.compressible_gray_pixels) as f64;
+                (eff_pixels * scale_sq * bpp) / 8.0 + (self.compressible_image_count as f64) * 64.0
+            }
+        };
+
+        (self.non_image_overhead_bytes as f64 + est_image_bytes)
+            .round()
+            .max(0.0) as usize
+    }
+
+    /// Solves for `scale` (`0.10..=1.00` in `0.01` steps) whose estimated size best matches
+    /// `target_bytes` while keeping `options.quality` and format fixed.
+    pub fn solve_scale_for_target(&self, options: &CompressionOptions, target_bytes: usize) -> f32 {
+        if self.compressible_image_count == 0 || target_bytes == 0 {
+            return options.scale.clamp(0.10, 1.00);
+        }
+
+        let current_scale = (options.scale.clamp(0.10, 1.00) * 100.0).round() / 100.0;
+        let mut probe = options.clone();
+        probe.scale = current_scale;
+        let mut best_scale = current_scale;
+        let mut best_diff = self
+            .estimate_compressed_bytes_impl(&probe, false)
+            .abs_diff(target_bytes);
+
+        // Evaluate all 0.01 scale steps; prefer higher scale on exact ties.
+        for pct in (10..=100).rev() {
+            let candidate = (pct as f32) / 100.0;
+            probe.scale = candidate;
+            let diff = self
+                .estimate_compressed_bytes_impl(&probe, false)
+                .abs_diff(target_bytes);
+            if diff < best_diff {
+                best_diff = diff;
+                best_scale = candidate;
+            }
+        }
+
+        best_scale
+    }
+
+    /// Solves for `quality` (`1..=100`) whose estimated size best matches `target_bytes`
+    /// while keeping `options.scale` and format fixed.
+    pub fn solve_quality_for_target(&self, options: &CompressionOptions, target_bytes: usize) -> u8 {
+        if self.compressible_image_count == 0
+            || target_bytes == 0
+            || !options.format.uses_quality()
+        {
+            return options.quality.clamp(1, 100);
+        }
+
+        let current_q = options.quality.clamp(1, 100);
+        let mut probe = options.clone();
+        probe.quality = current_q;
+        let mut best_q = current_q;
+        let mut best_diff = self.estimate_compressed_bytes(&probe).abs_diff(target_bytes);
+
+        for q in 1..=100 {
+            probe.quality = q;
+            let diff = self.estimate_compressed_bytes(&probe).abs_diff(target_bytes);
+            if diff < best_diff {
+                best_diff = diff;
+                best_q = q;
+            }
+        }
+
+        best_q
+    }
+
+    /// Adjusts `options.scale` first (`0.10..=1.00`), and if `scale` hits its lower or upper bound
+    /// on a quality-configurable format, adjusts `options.quality` (`1..=100`) to approach `target_bytes`.
+    pub fn apply_target_scale_first(&self, options: &mut CompressionOptions, target_bytes: usize) {
+        if self.compressible_image_count == 0 || target_bytes == 0 {
+            return;
+        }
+
+        let solved_scale = self.solve_scale_for_target(options, target_bytes);
+        options.scale = solved_scale;
+
+        if options.format.uses_quality() {
+            let est_bytes = self.estimate_compressed_bytes(options);
+            let hit_lower_and_over = solved_scale <= 0.105 && est_bytes > target_bytes;
+            let hit_upper_and_under = solved_scale >= 0.995 && est_bytes < target_bytes;
+            if hit_lower_and_over || hit_upper_and_under {
+                options.quality = self.solve_quality_for_target(options, target_bytes);
+            }
+        }
+    }
+}
+
+fn jpeg_quality_multiplier(q: f64) -> f64 {
+    let q = q.clamp(1.0, 100.0);
+    if q <= 50.0 {
+        0.18 + 0.82 * (q / 50.0).powf(0.85)
+    } else {
+        let t = (q - 50.0) / 50.0;
+        1.0 + 0.65 * t + 3.65 * t.powf(3.5)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -162,13 +356,9 @@ impl CompressionStats {
         ((orig - comp) / orig) * 100.0
     }
 
-    pub fn exceeds_2mb(&self) -> bool {
-        self.compressed_bytes > TWO_MB_BINARY_BYTES
-    }
-
-    pub fn near_2mb_decimal(&self) -> bool {
-        self.compressed_bytes > TWO_MB_DECIMAL_BYTES
-            && self.compressed_bytes <= TWO_MB_BINARY_BYTES
+    pub fn exceeds_target_mb(&self, target_mb: f64) -> bool {
+        let target_bytes = mb_to_bytes(target_mb);
+        target_mb > 0.0 && target_bytes > 0 && self.compressed_bytes > target_bytes
     }
 }
 
@@ -221,29 +411,210 @@ enum SkipReason {
     Unsupported(String),
 }
 
-/// Inspects a PDF in memory without modifying it, returning page and image counts.
+/// Inspects a PDF in memory without modifying it, recording layout/pixel metrics and
+/// sample-calibrating at most one representative large image for instant size estimation.
 pub fn inspect_pdf(input_bytes: &[u8]) -> Result<PdfSummary, PdfError> {
     let doc = load_unencrypted_document(input_bytes)?;
     let page_count = doc.get_pages().len();
     let subsidiary_masks = collect_subsidiary_mask_ids(&doc);
 
     let mut image_count = 0usize;
+    let mut compressible_image_count = 0usize;
+    let mut compressible_stream_bytes = 0usize;
+    let mut compressible_smask_ids = HashSet::new();
+    let mut non_compressible_smask_ids = HashSet::new();
+
+    let mut compressible_rgb_pixels = 0u64;
+    let mut compressible_gray_pixels = 0u64;
+    let mut orig_dct_image_count = 0usize;
+    let mut orig_dct_bytes = 0usize;
+    let mut orig_dct_rgb_pixels = 0u64;
+    let mut orig_dct_gray_pixels = 0u64;
+
+    let mut best_sample: Option<(ObjectId, u32, u32, u64)> = None;
+
     for (&id, obj) in &doc.objects {
         if subsidiary_masks.contains(&id) {
             continue;
         }
-        if let Object::Stream(stream) = obj {
-            if is_image_xobject(&doc, stream) {
-                image_count += 1;
+        let Object::Stream(stream) = obj else {
+            continue;
+        };
+        if !is_image_xobject(&doc, stream) {
+            continue;
+        }
+
+        image_count += 1;
+
+        let smask_ref_id = match stream.dict.get(b"SMask") {
+            Ok(Object::Reference(ref_id)) => Some(*ref_id),
+            _ => None,
+        };
+
+        let metadata = inspect_compressible_metadata(&doc, stream);
+        let Some((w, h, is_gray, filters)) = metadata else {
+            if let Some(ref_id) = smask_ref_id {
+                non_compressible_smask_ids.insert(ref_id);
             }
+            continue;
+        };
+
+        compressible_image_count += 1;
+        compressible_stream_bytes = compressible_stream_bytes.saturating_add(stream.content.len());
+        if let Some(ref_id) = smask_ref_id {
+            compressible_smask_ids.insert(ref_id);
+        }
+
+        let pixels = (w as u64) * (h as u64);
+        if is_gray {
+            compressible_gray_pixels = compressible_gray_pixels.saturating_add(pixels);
+        } else {
+            compressible_rgb_pixels = compressible_rgb_pixels.saturating_add(pixels);
+        }
+
+        let is_orig_dct =
+            filters.len() == 1 && filters[0] == b"DCTDecode" && stream.dict.get(b"SMask").is_err();
+        if is_orig_dct {
+            orig_dct_image_count += 1;
+            orig_dct_bytes = orig_dct_bytes.saturating_add(stream.content.len());
+            if is_gray {
+                orig_dct_gray_pixels = orig_dct_gray_pixels.saturating_add(pixels);
+            } else {
+                orig_dct_rgb_pixels = orig_dct_rgb_pixels.saturating_add(pixels);
+            }
+        }
+
+        if best_sample.is_none_or(|(_, _, _, best_px)| pixels > best_px) {
+            best_sample = Some((id, w, h, pixels));
+        }
+    }
+
+    for smask_id in compressible_smask_ids {
+        if !non_compressible_smask_ids.contains(&smask_id) {
+            if let Some(Object::Stream(smask_stream)) = doc.objects.get(&smask_id) {
+                compressible_stream_bytes =
+                    compressible_stream_bytes.saturating_add(smask_stream.content.len());
+            }
+        }
+    }
+
+    let non_image_overhead_bytes = input_bytes.len().saturating_sub(compressible_stream_bytes);
+
+    let (mut sample_rgb_jpeg_q50_bpp, mut sample_rgb_flate_bpp) =
+        (DEFAULT_RGB_JPEG_Q50_BPP, DEFAULT_RGB_FLATE_BPP);
+
+    if let Some((sample_id, sw, sh, _)) = best_sample {
+        if let Ok(extracted) = extract_image_from_doc(&doc, sample_id, sw, sh) {
+            let (calibrated_jpeg, calibrated_flate) = calibrate_sample_image(&extracted.image);
+            sample_rgb_jpeg_q50_bpp = calibrated_jpeg;
+            sample_rgb_flate_bpp = calibrated_flate;
         }
     }
 
     Ok(PdfSummary {
         page_count,
         image_count,
+        compressible_image_count,
         file_bytes: input_bytes.len(),
+        non_image_overhead_bytes,
+        compressible_rgb_pixels,
+        compressible_gray_pixels,
+        orig_dct_image_count,
+        orig_dct_bytes,
+        orig_dct_rgb_pixels,
+        orig_dct_gray_pixels,
+        sample_rgb_jpeg_q50_bpp,
+        sample_rgb_flate_bpp,
     })
+}
+
+fn inspect_compressible_metadata(
+    doc: &Document,
+    stream: &Stream,
+) -> Option<(u32, u32, bool, Vec<Vec<u8>>)> {
+    if is_image_mask(doc, stream) {
+        return None;
+    }
+    let (w, h) = read_image_dimensions(doc, stream)?;
+    if w < MIN_IMAGE_DIMENSION || h < MIN_IMAGE_DIMENSION {
+        return None;
+    }
+    if stream.dict.get(b"Mask").is_ok() {
+        return None;
+    }
+    let filters = extract_filters(doc, &stream.dict).ok()?;
+    validate_image_filters(&filters).ok()?;
+    let cs = resolve_color_space_spec(doc, stream).ok()?;
+    let is_gray = matches!(
+        cs,
+        ColorSpaceSpec::Direct(BaseColorSpace::Gray)
+            | ColorSpaceSpec::Indexed {
+                base: BaseColorSpace::Gray,
+                ..
+            }
+    );
+    Some((w, h, is_gray, filters))
+}
+
+fn calibrate_sample_image(img: &DynamicImage) -> (f64, f64) {
+    let orig_pixels = (img.width() as u64) * (img.height() as u64);
+    let owned_scaled;
+    let sample = if orig_pixels > MAX_CALIBRATION_PIXELS {
+        let ratio = (MAX_CALIBRATION_PIXELS as f64 / orig_pixels as f64).sqrt();
+        let nw = ((img.width() as f64) * ratio).round().max(1.0) as u32;
+        let nh = ((img.height() as f64) * ratio).round().max(1.0) as u32;
+        owned_scaled = img.resize_exact(nw, nh, FilterType::Triangle);
+        &owned_scaled
+    } else {
+        img
+    };
+
+    let w = sample.width();
+    let h = sample.height();
+    let px = (w as f64 * h as f64).max(1.0);
+    let is_gray = matches!(sample, DynamicImage::ImageLuma8(_));
+
+    let jpeg_bpp = match encode_jpeg_stream(sample, w, h, 50, None) {
+        Ok(encoded) => {
+            let payload = encoded.bytes.len().saturating_sub(600) as f64;
+            let raw_bpp = (payload * 8.0 / px).max(0.03);
+            if is_gray {
+                raw_bpp / GRAY_TO_RGB_JPEG_RATIO
+            } else {
+                raw_bpp
+            }
+        }
+        Err(_) => DEFAULT_RGB_JPEG_Q50_BPP,
+    };
+
+    let flate_bpp = {
+        let (raw_bytes, ext_color): (Vec<u8>, ExtendedColorType) = match sample {
+            DynamicImage::ImageLuma8(gray) => (gray.as_raw().clone(), ExtendedColorType::L8),
+            _ => (sample.to_rgb8().into_raw(), ExtendedColorType::Rgb8),
+        };
+        let mut png_buf = Vec::new();
+        let png_enc = PngEncoder::new_with_quality(
+            &mut png_buf,
+            CompressionType::Default,
+            PngFilterType::Adaptive,
+        );
+        if png_enc.write_image(&raw_bytes, w, h, ext_color).is_ok() {
+            let idat_len = extract_png_idat_stream(&png_buf)
+                .map(|(_, data)| data.len())
+                .unwrap_or_else(|| png_buf.len().saturating_sub(57));
+            // Scale Default zlib (level 6) down ~4% to match CompressionType::Best used in export.
+            let raw_bpp = (((idat_len as f64) * 0.96) * 8.0 / px).max(0.03);
+            if is_gray {
+                raw_bpp / GRAY_TO_RGB_FLATE_RATIO
+            } else {
+                raw_bpp
+            }
+        } else {
+            DEFAULT_RGB_FLATE_BPP
+        }
+    };
+
+    (jpeg_bpp, flate_bpp)
 }
 
 /// Compresses embedded images inside a PDF while leaving page boxes (`/MediaBox`, `/CropBox`)
@@ -582,6 +953,44 @@ fn decompress_stream_with_resolved_dict(
         .map_err(|e| SkipReason::Unsupported(format!("Stream decompression skipped: {e}")))
 }
 
+fn validate_image_filters(filters: &[Vec<u8>]) -> Result<bool, SkipReason> {
+    for f in filters {
+        if matches!(
+            f.as_slice(),
+            b"CCITTFaxDecode" | b"JBIG2Decode" | b"JPXDecode" | b"Crypt"
+        ) {
+            let name = String::from_utf8_lossy(f);
+            return Err(SkipReason::Unsupported(format!(
+                "Kept /{name} image unchanged (already specialized compression)."
+            )));
+        }
+    }
+
+    let last_is_dct = filters.last().is_some_and(|f| f == b"DCTDecode");
+    let prefix_limit = if last_is_dct {
+        filters.len().saturating_sub(1)
+    } else {
+        filters.len()
+    };
+    for f in &filters[..prefix_limit] {
+        if !matches!(
+            f.as_slice(),
+            b"FlateDecode"
+                | b"LZWDecode"
+                | b"ASCII85Decode"
+                | b"ASCIIHexDecode"
+                | b"RunLengthDecode"
+        ) {
+            let name = String::from_utf8_lossy(f);
+            return Err(SkipReason::Unsupported(format!(
+                "Kept image with unsupported /{name} filter."
+            )));
+        }
+    }
+
+    Ok(last_is_dct)
+}
+
 fn extract_image_from_doc(
     doc: &Document,
     id: ObjectId,
@@ -605,19 +1014,7 @@ fn extract_image_from_doc(
     }
 
     let filters = extract_filters(doc, &stream.dict)?;
-    for f in &filters {
-        if matches!(
-            f.as_slice(),
-            b"CCITTFaxDecode" | b"JBIG2Decode" | b"JPXDecode" | b"Crypt"
-        ) {
-            let name = String::from_utf8_lossy(f);
-            return Err(SkipReason::Unsupported(format!(
-                "Kept /{name} image unchanged (already specialized compression)."
-            )));
-        }
-    }
-
-    let last_is_dct = filters.last().is_some_and(|f| f == b"DCTDecode");
+    let last_is_dct = validate_image_filters(&filters)?;
     let orig_raw_len = stream.content.len();
 
     let mut base_img = if last_is_dct {
@@ -628,21 +1025,6 @@ fn extract_image_from_doc(
         };
         decode_dct_image(doc, stream, &jpeg_bytes)?
     } else {
-        for f in &filters {
-            if !matches!(
-                f.as_slice(),
-                b"FlateDecode"
-                    | b"LZWDecode"
-                    | b"ASCII85Decode"
-                    | b"ASCIIHexDecode"
-                    | b"RunLengthDecode"
-            ) {
-                let name = String::from_utf8_lossy(f);
-                return Err(SkipReason::Unsupported(format!(
-                    "Kept image with unsupported /{name} filter."
-                )));
-            }
-        }
         let raw_samples = if filters.is_empty() {
             stream.content.clone()
         } else {
@@ -1713,5 +2095,182 @@ mod tests {
     fn rejects_invalid_pdf_gracefully_without_panic() {
         let err = inspect_pdf(b"not a real pdf").expect_err("should fail cleanly");
         assert!(matches!(err, PdfError::Parse(_)));
+    }
+
+    #[test]
+    fn target_size_helpers_handle_zero_and_thresholds_correctly() {
+        let stats = CompressionStats {
+            original_bytes: 5 * 1024 * 1024,
+            compressed_bytes: 2 * 1024 * 1024 + 512,
+            ..Default::default()
+        };
+
+        assert!(!stats.exceeds_target_mb(0.0));
+        assert!(!stats.exceeds_target_mb(2.5));
+        assert!(stats.exceeds_target_mb(2.0));
+
+        let exact_2mb = CompressionStats {
+            original_bytes: 5 * 1024 * 1024,
+            compressed_bytes: 2 * 1024 * 1024,
+            ..Default::default()
+        };
+        assert!(!exact_2mb.exceeds_target_mb(2.0));
+    }
+
+    #[test]
+    fn size_estimator_scales_monotonically_and_tracks_real_output() {
+        let width = 400u32;
+        let height = 300u32;
+        let mut pixels = Vec::with_capacity((width * height * 3) as usize);
+        for y in 0..height {
+            for x in 0..width {
+                let v = ((x * 7 + y * 13) % 251) as u8;
+                pixels.push(v);
+                pixels.push(((x * 3) % 255) as u8);
+                pixels.push(((y * 5) % 255) as u8);
+            }
+        }
+
+        let input = build_test_pdf_with_image(width, height, "DeviceRGB", pixels, false);
+        let summary = inspect_pdf(&input).expect("inspect succeeds");
+        assert_eq!(summary.compressible_image_count, 1);
+        assert_eq!(summary.compressible_rgb_pixels, (width * height) as u64);
+
+        let est_q50_full = summary.estimate_compressed_bytes(&CompressionOptions {
+            format: ImageFormatChoice::Jpeg,
+            quality: 50,
+            scale: 1.0,
+            resize_filter: ResizeFilterChoice::Lanczos3,
+        });
+        let est_q50_half = summary.estimate_compressed_bytes(&CompressionOptions {
+            format: ImageFormatChoice::Jpeg,
+            quality: 50,
+            scale: 0.5,
+            resize_filter: ResizeFilterChoice::Lanczos3,
+        });
+        let est_q50_quarter = summary.estimate_compressed_bytes(&CompressionOptions {
+            format: ImageFormatChoice::Jpeg,
+            quality: 50,
+            scale: 0.25,
+            resize_filter: ResizeFilterChoice::Lanczos3,
+        });
+        assert!(est_q50_full > est_q50_half);
+        assert!(est_q50_half > est_q50_quarter);
+
+        let est_q20 = summary.estimate_compressed_bytes(&CompressionOptions {
+            format: ImageFormatChoice::Jpeg,
+            quality: 20,
+            scale: 0.5,
+            resize_filter: ResizeFilterChoice::Lanczos3,
+        });
+        let est_q90 = summary.estimate_compressed_bytes(&CompressionOptions {
+            format: ImageFormatChoice::Jpeg,
+            quality: 90,
+            scale: 0.5,
+            resize_filter: ResizeFilterChoice::Lanczos3,
+        });
+        assert!(est_q90 > est_q50_half);
+        assert!(est_q50_half > est_q20);
+
+        let opts = CompressionOptions {
+            format: ImageFormatChoice::Jpeg,
+            quality: 50,
+            scale: 0.5,
+            resize_filter: ResizeFilterChoice::Lanczos3,
+        };
+        let (actual_out, _) = compress_pdf(&input, &opts, |_| {}).expect("compress succeeds");
+        let actual_len = actual_out.len() as f64;
+        let est_len = summary.estimate_compressed_bytes(&opts) as f64;
+        assert!(
+            est_len > actual_len * 0.4 && est_len < actual_len * 2.2,
+            "estimate {est_len} vs actual {actual_len}"
+        );
+
+        // PDFs with no compressible images should estimate equal to input file size.
+        let tiny_only = build_test_pdf_with_image(20, 20, "DeviceRGB", vec![128; 20 * 20 * 3], false);
+        let tiny_summary = inspect_pdf(&tiny_only).expect("inspect tiny");
+        assert_eq!(tiny_summary.compressible_image_count, 0);
+        assert_eq!(tiny_summary.estimate_compressed_bytes(&opts), tiny_only.len());
+    }
+
+    #[test]
+    fn inverse_coupling_solvers_adjust_scale_and_quality_cleanly() {
+        let synthetic_summary = PdfSummary {
+            page_count: 10,
+            image_count: 10,
+            compressible_image_count: 10,
+            file_bytes: 10 * 1024 * 1024,
+            non_image_overhead_bytes: 200 * 1024,
+            compressible_rgb_pixels: 80_000_000,
+            compressible_gray_pixels: 0,
+            orig_dct_image_count: 0,
+            orig_dct_bytes: 0,
+            orig_dct_rgb_pixels: 0,
+            orig_dct_gray_pixels: 0,
+            sample_rgb_jpeg_q50_bpp: 1.0,
+            sample_rgb_flate_bpp: 8.0,
+        };
+        let target_2mb = 2 * 1024 * 1024;
+
+        // 1. Increasing quality should decrease solved scale to preserve ~2 MB target.
+        let low_q_opts = CompressionOptions {
+            format: ImageFormatChoice::Jpeg,
+            quality: 30,
+            scale: 0.50,
+            resize_filter: ResizeFilterChoice::Lanczos3,
+        };
+        let high_q_opts = CompressionOptions {
+            quality: 85,
+            ..low_q_opts.clone()
+        };
+        let scale_at_low_q = synthetic_summary.solve_scale_for_target(&low_q_opts, target_2mb);
+        let scale_at_high_q = synthetic_summary.solve_scale_for_target(&high_q_opts, target_2mb);
+        assert!(scale_at_low_q > scale_at_high_q);
+
+        // 2. Increasing scale should decrease solved quality to preserve ~2 MB target.
+        let small_scale_opts = CompressionOptions {
+            format: ImageFormatChoice::Jpeg,
+            quality: 50,
+            scale: 0.30,
+            resize_filter: ResizeFilterChoice::Lanczos3,
+        };
+        let large_scale_opts = CompressionOptions {
+            scale: 0.60,
+            ..small_scale_opts.clone()
+        };
+        let q_at_small_scale =
+            synthetic_summary.solve_quality_for_target(&small_scale_opts, target_2mb);
+        let q_at_large_scale =
+            synthetic_summary.solve_quality_for_target(&large_scale_opts, target_2mb);
+        assert!(q_at_small_scale > q_at_large_scale);
+
+        // 3. Target-first adjusts scale first, and only changes quality if scale hits bounds.
+        let mut opts_mid = CompressionOptions::default();
+        synthetic_summary.apply_target_scale_first(&mut opts_mid, target_2mb);
+        assert_eq!(opts_mid.quality, 50);
+        assert!(opts_mid.scale > 0.10 && opts_mid.scale < 1.00);
+
+        // Target below 0.10x @ Q50 (~308 KB): hits 0.10x lower bound and lowers quality below 50.
+        let mut opts_tiny_target = CompressionOptions::default();
+        synthetic_summary.apply_target_scale_first(&mut opts_tiny_target, 250 * 1024);
+        assert!((opts_tiny_target.scale - 0.10).abs() < 1e-4);
+        assert!(opts_tiny_target.quality < 50);
+
+        // Target above 1.00x @ Q50 (~10 MB): hits 1.00x upper bound and raises quality above 50.
+        let mut opts_large_target = CompressionOptions::default();
+        synthetic_summary.apply_target_scale_first(&mut opts_large_target, 15 * 1024 * 1024);
+        assert!((opts_large_target.scale - 1.00).abs() < 1e-4);
+        assert!(opts_large_target.quality > 50);
+
+        // 4. Lossless PNG leaves quality untouched and only tunes scale.
+        let mut opts_png = CompressionOptions {
+            format: ImageFormatChoice::Png,
+            quality: 42,
+            scale: 0.50,
+            resize_filter: ResizeFilterChoice::Lanczos3,
+        };
+        synthetic_summary.apply_target_scale_first(&mut opts_png, target_2mb);
+        assert_eq!(opts_png.quality, 42);
+        assert!((opts_png.scale - 0.15).abs() < 0.05);
     }
 }

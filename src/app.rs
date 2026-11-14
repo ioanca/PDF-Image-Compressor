@@ -7,8 +7,8 @@ use eframe::egui::{self, Color32, CornerRadius, Frame, Margin, RichText, Stroke}
 use rfd::FileDialog;
 
 use crate::pdf_processor::{
-    compress_pdf, inspect_pdf, CompressionOptions, CompressionStats, ImageFormatChoice,
-    PdfSummary, ProgressUpdate, ResizeFilterChoice,
+    bytes_to_mb, compress_pdf, inspect_pdf, mb_to_bytes, CompressionOptions, CompressionStats,
+    ImageFormatChoice, PdfSummary, ProgressUpdate, ResizeFilterChoice,
 };
 
 struct LoadedPdf {
@@ -43,6 +43,8 @@ struct CompletedResult {
 pub struct PdfCompressorApp {
     loaded: Option<LoadedPdf>,
     options: CompressionOptions,
+    target_size_enabled: bool,
+    target_size_mb: f32,
     worker_rx: Option<Receiver<WorkerEvent>>,
     progress: Option<ProgressUpdate>,
     last_result: Option<CompletedResult>,
@@ -55,6 +57,8 @@ impl Default for PdfCompressorApp {
         Self {
             loaded: None,
             options: CompressionOptions::default(),
+            target_size_enabled: false,
+            target_size_mb: 2.0,
             worker_rx: None,
             progress: None,
             last_result: None,
@@ -111,6 +115,14 @@ impl PdfCompressorApp {
     fn load_pdf_bytes(&mut self, path: Option<PathBuf>, file_name: String, bytes: Vec<u8>) {
         match inspect_pdf(&bytes) {
             Ok(summary) => {
+                let original_mb = bytes_to_mb(summary.file_bytes) as f32;
+                self.target_size_mb = self.target_size_mb.clamp(0.0, original_mb);
+                if self.target_size_enabled && self.target_size_mb > 0.0 {
+                    let target_bytes = mb_to_bytes(f64::from(self.target_size_mb));
+                    if target_bytes > 0 {
+                        summary.apply_target_scale_first(&mut self.options, target_bytes);
+                    }
+                }
                 self.loaded = Some(LoadedPdf {
                     path,
                     file_name,
@@ -396,7 +408,15 @@ impl PdfCompressorApp {
                 ui.add_space(8.0);
 
                 ui.add_enabled_ui(!busy, |ui| {
+                    let mut format_changed = false;
+                    let mut quality_changed = false;
+                    let mut scale_changed = false;
+                    let mut filter_changed = false;
+                    let mut target_changed = false;
+                    let mut enabled_toggled_on = false;
+
                     // Format / Algorithm dropdown
+                    let prev_format = self.options.format;
                     ui.horizontal(|ui| {
                         ui.label("Image Format:");
                         egui::ComboBox::from_id_salt("image_format_selector")
@@ -412,6 +432,9 @@ impl PdfCompressorApp {
                                 }
                             });
                     });
+                    if self.options.format != prev_format {
+                        format_changed = true;
+                    }
 
                     if let Some(note) = self.options.format.compatibility_note() {
                         ui.add_space(6.0);
@@ -436,11 +459,18 @@ impl PdfCompressorApp {
 
                     // Quality slider
                     let uses_quality = self.options.format.uses_quality();
+                    let prev_quality = self.options.quality;
                     ui.horizontal(|ui| {
                         ui.label("Quality:");
                         let slider = egui::Slider::new(&mut self.options.quality, 1..=100)
                             .clamping(egui::SliderClamping::Always);
-                        ui.add_enabled(uses_quality, slider);
+                        let quality_resp = ui.add_enabled(uses_quality, slider);
+                        if uses_quality
+                            && quality_resp.changed()
+                            && self.options.quality != prev_quality
+                        {
+                            quality_changed = true;
+                        }
                         if !uses_quality {
                             ui.label(
                                 RichText::new("(Lossless mode — ignored)")
@@ -453,14 +483,20 @@ impl PdfCompressorApp {
                     ui.add_space(8.0);
 
                     // Resolution Scale slider + quick preset buttons
+                    let prev_scale = self.options.scale;
                     ui.horizontal(|ui| {
                         ui.label("Resolution Scale:");
-                        ui.add(
+                        let scale_resp = ui.add(
                             egui::Slider::new(&mut self.options.scale, 0.10..=1.00)
                                 .step_by(0.05)
+                                .clamping(egui::SliderClamping::Edits)
                                 .fixed_decimals(2)
                                 .suffix("x"),
                         );
+                        if scale_resp.changed() && (self.options.scale - prev_scale).abs() >= 1e-4
+                        {
+                            scale_changed = true;
+                        }
                     });
 
                     ui.add_space(4.0);
@@ -476,9 +512,10 @@ impl PdfCompressorApp {
                             ("0.75x", 0.75_f32),
                             ("1.0x", 1.00_f32),
                         ] {
-                            let selected = (self.options.scale - value).abs() < 0.01;
+                            let selected = (self.options.scale - value).abs() < 0.005;
                             if ui.selectable_label(selected, label).clicked() {
                                 self.options.scale = value;
+                                scale_changed = true;
                             }
                         }
                     });
@@ -486,6 +523,7 @@ impl PdfCompressorApp {
                     ui.add_space(8.0);
 
                     // Resize filter choice
+                    let prev_filter = self.options.resize_filter;
                     ui.horizontal(|ui| {
                         ui.label("Resize Filter:");
                         for filter in ResizeFilterChoice::ALL {
@@ -495,6 +533,123 @@ impl PdfCompressorApp {
                             }
                         }
                     });
+                    if self.options.resize_filter != prev_filter {
+                        filter_changed = true;
+                    }
+
+                    ui.add_space(8.0);
+
+                    // Unified toggleable Target Size / Estimated Size row
+                    ui.horizontal(|ui| {
+                        let prev_enabled = self.target_size_enabled;
+                        let cb_label = if self.target_size_enabled {
+                            "Target Size (MB):"
+                        } else {
+                            "Target Size"
+                        };
+                        let cb_resp = ui.checkbox(&mut self.target_size_enabled, cb_label);
+                        if cb_resp.changed() && self.target_size_enabled && !prev_enabled {
+                            enabled_toggled_on = true;
+                        }
+
+                        if !self.target_size_enabled {
+                            ui.add_space(6.0);
+                            self.render_estimated_size_inline(ui);
+                        } else {
+                            let has_file = self.loaded.is_some();
+                            let max_target_mb = self
+                                .loaded
+                                .as_ref()
+                                .map(|l| (bytes_to_mb(l.summary.file_bytes) as f32).max(1e-6))
+                                .unwrap_or(10.0);
+                            let target_decimals = if has_file {
+                                target_decimals_for_mb(f64::from(max_target_mb))
+                            } else {
+                                2
+                            };
+                            let prev_target = self.target_size_mb;
+
+                            ui.add_enabled_ui(has_file, |ui| {
+                                let slider_resp = ui.add(
+                                    egui::Slider::new(
+                                        &mut self.target_size_mb,
+                                        0.0..=max_target_mb,
+                                    )
+                                    .show_value(false)
+                                    .clamping(egui::SliderClamping::Always),
+                                );
+                                let drag_resp = ui.add(
+                                    egui::DragValue::new(&mut self.target_size_mb)
+                                        .range(0.0..=max_target_mb)
+                                        .speed((f64::from(max_target_mb) / 200.0).clamp(0.001, 0.25))
+                                        .fixed_decimals(target_decimals)
+                                        .suffix(" MB"),
+                                );
+                                if (slider_resp.changed() || drag_resp.changed())
+                                    && (self.target_size_mb - prev_target).abs() >= 1e-5
+                                {
+                                    target_changed = true;
+                                }
+                            });
+
+                            if has_file {
+                                self.target_size_mb = self.target_size_mb.clamp(0.0, max_target_mb);
+                                if self.target_size_mb <= 0.0 {
+                                    ui.label(
+                                        RichText::new("(No limit)")
+                                            .size(12.0)
+                                            .color(ui.visuals().weak_text_color()),
+                                    );
+                                } else if let Some(loaded) = &self.loaded {
+                                    let est_bytes =
+                                        loaded.summary.estimate_compressed_bytes(&self.options);
+                                    ui.label(
+                                        RichText::new(format!(
+                                            "(est. ~{})",
+                                            format_bytes(est_bytes)
+                                        ))
+                                        .size(12.0)
+                                        .color(ui.visuals().weak_text_color()),
+                                    );
+                                }
+                            }
+                        }
+                    });
+
+                    // Apply automatic inverse coupling strictly on user-changed events to avoid loops.
+                    if self.target_size_enabled && self.target_size_mb > 0.0 {
+                        if let Some(loaded) = &self.loaded {
+                            let target_bytes = mb_to_bytes(f64::from(self.target_size_mb));
+                            if target_bytes > 0 {
+                                let before_q = self.options.quality;
+                                let before_s = self.options.scale;
+
+                                if enabled_toggled_on
+                                    || target_changed
+                                    || format_changed
+                                    || filter_changed
+                                {
+                                    loaded
+                                        .summary
+                                        .apply_target_scale_first(&mut self.options, target_bytes);
+                                } else if quality_changed {
+                                    self.options.scale = loaded
+                                        .summary
+                                        .solve_scale_for_target(&self.options, target_bytes);
+                                } else if scale_changed && self.options.format.uses_quality() {
+                                    self.options.quality = loaded
+                                        .summary
+                                        .solve_quality_for_target(&self.options, target_bytes);
+                                }
+
+                                if self.options.quality != before_q
+                                    || (self.options.scale - before_s).abs() >= 1e-4
+                                {
+                                    ui.ctx().request_repaint();
+                                }
+                            }
+                        }
+                    }
                 });
 
                 ui.add_space(8.0);
@@ -508,13 +663,49 @@ impl PdfCompressorApp {
             });
     }
 
+    fn render_estimated_size_inline(&self, ui: &mut egui::Ui) {
+        let Some(loaded) = &self.loaded else {
+            ui.label(
+                RichText::new("Estimated Size: — (load a PDF to preview estimate)")
+                    .size(12.5)
+                    .color(ui.visuals().weak_text_color()),
+            );
+            return;
+        };
+
+        let est_bytes = loaded.summary.estimate_compressed_bytes(&self.options);
+        ui.label(
+            RichText::new(format!("Estimated Size: ~{}", format_bytes(est_bytes)))
+                .strong()
+                .color(ui.visuals().strong_text_color()),
+        );
+
+        let orig_bytes = loaded.summary.file_bytes;
+        if orig_bytes > 0 {
+            let saved_pct = ((orig_bytes as f64 - est_bytes as f64) / orig_bytes as f64) * 100.0;
+            let pct_note = if saved_pct >= 0.0 {
+                format!("(~{saved_pct:.0}% smaller)")
+            } else {
+                format!("(~{:.0}% larger)", saved_pct.abs())
+            };
+            ui.label(
+                RichText::new(pct_note)
+                    .size(12.0)
+                    .color(ui.visuals().weak_text_color()),
+            );
+        }
+    }
+
     fn render_summary_card(&self, ui: &mut egui::Ui, result: &CompletedResult) {
         let dark = ui.visuals().dark_mode;
         let stats = &result.stats;
-        let over_2mb = stats.exceeds_2mb();
-        let near_2mb = stats.near_2mb_decimal();
+        let target_bytes = mb_to_bytes(f64::from(self.target_size_mb));
+        let has_active_target =
+            self.target_size_enabled && self.target_size_mb > 0.0 && target_bytes > 0;
+        let over_target =
+            has_active_target && stats.exceeds_target_mb(f64::from(self.target_size_mb));
 
-        let (card_fill, border_color) = if over_2mb {
+        let (card_fill, border_color) = if over_target {
             if dark {
                 (Color32::from_rgb(48, 30, 30), Color32::from_rgb(200, 75, 75))
             } else {
@@ -536,49 +727,26 @@ impl PdfCompressorApp {
                 ui.horizontal(|ui| {
                     ui.label(RichText::new("Compression Summary").strong().size(15.0));
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if over_2mb {
-                            let badge_fill = Color32::from_rgb(198, 40, 40);
-                            Frame::new()
-                                .fill(badge_fill)
-                                .corner_radius(CornerRadius::same(6))
-                                .inner_margin(Margin::symmetric(8, 4))
-                                .show(ui, |ui| {
-                                    ui.label(
-                                        RichText::new("OVER 2.0 MB")
-                                            .strong()
-                                            .size(12.0)
-                                            .color(Color32::WHITE),
-                                    );
-                                });
-                        } else if near_2mb {
-                            let badge_fill = Color32::from_rgb(184, 118, 12);
-                            Frame::new()
-                                .fill(badge_fill)
-                                .corner_radius(CornerRadius::same(6))
-                                .inner_margin(Margin::symmetric(8, 4))
-                                .show(ui, |ui| {
-                                    ui.label(
-                                        RichText::new("NEAR 2.0 MB (>2,000,000 B)")
-                                            .strong()
-                                            .size(11.5)
-                                            .color(Color32::WHITE),
-                                    );
-                                });
+                        let (badge_text, badge_fill) = if over_target {
+                            ("OVER TARGET", Color32::from_rgb(198, 40, 40))
+                        } else if has_active_target {
+                            ("UNDER TARGET", Color32::from_rgb(34, 139, 72))
                         } else {
-                            let badge_fill = Color32::from_rgb(34, 139, 72);
-                            Frame::new()
-                                .fill(badge_fill)
-                                .corner_radius(CornerRadius::same(6))
-                                .inner_margin(Margin::symmetric(8, 4))
-                                .show(ui, |ui| {
-                                    ui.label(
-                                        RichText::new("UNDER 2.0 MB")
-                                            .strong()
-                                            .size(12.0)
-                                            .color(Color32::WHITE),
-                                    );
-                                });
-                        }
+                            ("COMPRESSED", Color32::from_rgb(34, 139, 72))
+                        };
+
+                        Frame::new()
+                            .fill(badge_fill)
+                            .corner_radius(CornerRadius::same(6))
+                            .inner_margin(Margin::symmetric(8, 4))
+                            .show(ui, |ui| {
+                                ui.label(
+                                    RichText::new(badge_text)
+                                        .strong()
+                                        .size(12.0)
+                                        .color(Color32::WHITE),
+                                );
+                            });
                     });
                 });
 
@@ -625,12 +793,22 @@ impl PdfCompressorApp {
                         ui.end_row();
                     });
 
-                if over_2mb {
+                if over_target {
+                    let excess = stats.compressed_bytes.saturating_sub(target_bytes);
+                    let target_decimals = self
+                        .loaded
+                        .as_ref()
+                        .map(|l| target_decimals_for_mb(bytes_to_mb(l.summary.file_bytes)))
+                        .unwrap_or(2);
                     ui.add_space(6.0);
                     ui.label(
-                        RichText::new(
-                            "Warning: Output still exceeds 2.0 MB. Try JPEG format with a lower Resolution Scale (e.g., 0.25x) or lower Quality (e.g., 35).",
-                        )
+                        RichText::new(format!(
+                            "Warning: Output ({}) exceeds your {:.prec$} MB target by {}. Try JPEG format with a lower Resolution Scale or lower Quality.",
+                            format_bytes(stats.compressed_bytes),
+                            self.target_size_mb,
+                            format_bytes(excess),
+                            prec = target_decimals,
+                        ))
                         .size(12.0)
                         .color(if dark {
                             Color32::from_rgb(255, 160, 160)
@@ -638,20 +816,13 @@ impl PdfCompressorApp {
                             Color32::from_rgb(165, 29, 29)
                         }),
                     );
-                } else if near_2mb {
-                    ui.add_space(6.0);
-                    ui.label(
-                        RichText::new(
-                            "Heads-up: Output is under 2.0 MiB (2,097,152 B) but slightly above 2,000,000 bytes. Some strict upload portals may reject it.",
-                        )
-                        .size(12.0),
-                    );
                 }
 
                 ui.add_space(8.0);
                 ui.label(
                     RichText::new(format!(
-                        "Images: {} recompressed • {} kept original • {} small/masks skipped • {} unsupported skipped",
+                        "Images ({} total): {} recompressed • {} kept original • {} small/masks skipped • {} unsupported skipped",
+                        stats.total_image_objects,
                         stats.images_recompressed,
                         stats.images_kept_original,
                         stats.images_skipped_small_or_mask,
@@ -701,16 +872,7 @@ impl eframe::App for PdfCompressorApp {
 
         egui::CentralPanel::default().show(ui, |ui| {
             egui::ScrollArea::vertical().show(ui, |ui| {
-                ui.add_space(4.0);
-                ui.heading("PDF Image Compressor");
-                ui.label(
-                    RichText::new(
-                        "Shrink scanned PDFs and photo documents while keeping exact page size and visual layout intact.",
-                    )
-                    .size(13.0)
-                    .color(ui.visuals().weak_text_color()),
-                );
-                ui.add_space(12.0);
+                ui.add_space(2.0);
 
                 self.render_file_card(ui, busy, is_hovered);
                 ui.add_space(12.0);
@@ -795,6 +957,16 @@ impl eframe::App for PdfCompressorApp {
                 }
             });
         });
+    }
+}
+
+fn target_decimals_for_mb(max_mb: f64) -> usize {
+    if max_mb < 0.005 {
+        4
+    } else if max_mb < 0.05 {
+        3
+    } else {
+        2
     }
 }
 

@@ -6,7 +6,7 @@ A fast, lightweight, single-executable desktop GUI application in Rust for shrin
 
 - **Native GUI & File Dialogs:** Built with `eframe`/`egui` and `rfd` (plus drag-and-drop `.pdf` support).
 - **One-Click Pipeline:** Select a PDF, pick your target format/quality/scale, and click **Compress & Save As...** (defaults to `<original_name>_compressed.pdf`).
-- **Size Limit Feedback:** Displays Original Size, New Size, Space Saved (%), image processing counts, and an **OVER 2.0 MB** warning badge if the result still exceeds upload limits.
+- **Toggleable Target Size & Live Estimated Size:** Displays an instant `Estimated Size` readout while unchecked, or checks **Target Size (MB)** to automatically couple Quality and Resolution Scale inversely toward your exact MB budget, with **COMPRESSED** / **UNDER TARGET** / **OVER TARGET** summary feedback.
 - **PDF Format & Compatibility:**
   - **JPEG (`/DCTDecode`)**: Recommended for scanned homework and photos.
   - **PNG (`/FlateDecode` with PNG Predictor 15)**: Lossless PDF-native stream compression.
