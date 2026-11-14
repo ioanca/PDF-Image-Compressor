@@ -67,17 +67,8 @@ impl ImageFormatChoice {
 
     pub fn label(self) -> &'static str {
         match self {
-            Self::Jpeg => "JPEG (/DCTDecode — Recommended for photos)",
-            Self::Png => "PNG (/FlateDecode — Lossless)",
-            Self::Webp => "WebP (Transcoded -> PDF /FlateDecode)",
-            Self::Avif => "AVIF (Transcoded -> PDF /DCTDecode)",
-        }
-    }
-
-    pub fn short_name(self) -> &'static str {
-        match self {
             Self::Jpeg => "JPEG",
-            Self::Png => "PNG (Lossless)",
+            Self::Png => "PNG",
             Self::Webp => "WebP",
             Self::Avif => "AVIF",
         }
@@ -111,8 +102,8 @@ impl ResizeFilterChoice {
 
     pub fn label(self) -> &'static str {
         match self {
-            Self::Lanczos3 => "Lanczos3 (Sharpest)",
-            Self::CatmullRom => "Catmull-Rom (Fast & crisp)",
+            Self::Lanczos3 => "Fancy",
+            Self::CatmullRom => "Fast",
         }
     }
 
@@ -334,6 +325,7 @@ pub struct ProgressUpdate {
 }
 
 #[derive(Debug, Clone, Default)]
+#[allow(dead_code)]
 pub struct CompressionStats {
     pub original_bytes: usize,
     pub compressed_bytes: usize,

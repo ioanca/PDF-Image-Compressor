@@ -3,14 +3,17 @@
 mod app;
 mod pdf_processor;
 
-use app::PdfCompressorApp;
+use app::{
+    PdfCompressorApp, DEFAULT_WINDOW_HEIGHT, DEFAULT_WINDOW_WIDTH, MIN_WINDOW_HEIGHT,
+    MIN_WINDOW_WIDTH,
+};
 use eframe::egui;
 
 fn main() -> eframe::Result {
     let native_options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([640.0, 680.0])
-            .with_min_inner_size([520.0, 560.0])
+            .with_inner_size([DEFAULT_WINDOW_WIDTH, DEFAULT_WINDOW_HEIGHT])
+            .with_min_inner_size([MIN_WINDOW_WIDTH, MIN_WINDOW_HEIGHT])
             .with_drag_and_drop(true),
         ..Default::default()
     };
