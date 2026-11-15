@@ -116,4 +116,5 @@ main/
 
 1. **Optional Encryption & Metadata Controls**: Add user-password unlocking prompts and optional stripping/editing of document metadata (`/Info` and XMP).
 2. **Per-Page Preview & Visual Diff**: Render side-by-side page thumbnails comparing original vs. compressed image quality before saving.
-3. **CLI & Watch-Folder Mode**: Expose a headless command-line mode for automated batch compression workflows without launching the GUI.
+3. **Support for standalone photos**: The app currently supports exclusively PDFs. I intend too add support for images (maybe even other formats like .doc and .xls).
+4.  **Color management**: The ability to change the depth/color mode of the photos (grayscale, cmyk, rgb, 1/4/8/16 bit) through a separate options tab.
