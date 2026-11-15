@@ -99,7 +99,7 @@ The compression pipeline combines fast analytical size estimation with parallel 
 ### File Structure
 
 ```text
-Popa/
+main/
 ├── .cargo/
 │   └── config.toml         # Windows GNU MinGW linker & mozjpeg-sys CFLAGS config
 ├── src/
