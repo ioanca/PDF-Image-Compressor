@@ -36,9 +36,6 @@ The PDF Image Compressor is a desktop tool built to shrink bloated PDFs without 
 ## Installation & Setup
 
 1. **Navigate to the project directory:**
-   ```powershell
-   cd Popa
-   ```
 
 2. **Build the standalone release executable:**
    ```powershell
