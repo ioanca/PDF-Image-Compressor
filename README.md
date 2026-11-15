@@ -4,9 +4,10 @@ A fast, lightweight, single-executable desktop GUI application in Rust for shrin
 
 ## Features
 
-- **Native GUI & File Dialogs:** Built with `eframe`/`egui` and `rfd` (plus drag-and-drop `.pdf` support).
-- **One-Click Pipeline:** Select a PDF, pick your target format/quality/scale, and click **Compress & Save** (defaults to `<original_name>_compressed.pdf`).
-- **Always-Visible Compression Summary:** Displays **Original Size**, **New Size**, and **Space Saved** cleanly (showing estimated percentage saved once a PDF is loaded and `-` before load or for New Size prior to export), with **COMPRESSED** / **UNDER TARGET** / **OVER TARGET** badge states and the saved file path.
+- **Native GUI & Batch File Support:** Built with `eframe`/`egui` and `rfd` (`Select PDF` supports single or multi-file selection, plus drag-and-drop for one or multiple `.pdf` files).
+- **Single & Batch Export:** Select a single PDF to pick an output file via **Save As** (defaulting to `<original_name>_compressed.pdf`), or load multiple PDFs to export all of them into a chosen destination folder (`<original_stem>_compressed.pdf`).
+- **Per-File & Shared Settings (`Apply for ALL`):** Configure format (`JPEG`, `PNG`, `WebP`, `AVIF`), quality, resolution scale, resize filter (`Fancy` / `Fast`), and a 3-state **Target Size** cycle (`Off` → `Target Size (MB)` → `Target Size (%)` with inverse Quality/Scale coupling) per file, across multi-selected rows (`Click`, `Ctrl/Cmd+Click`, `Shift+Click`, `Ctrl/Cmd+A`), or across all loaded files via **Apply for ALL**.
+- **Always-Visible Compression Summary:** In single-file mode, displays **Original Size**, **New Size**, and **Space Saved** cleanly (showing estimated percentage saved prior to export and `-` before load), with **COMPRESSED** / **UNDER TARGET** / **OVER TARGET** badge states. In multi-file mode, shows an Explorer-aligned 4-column per-row summary (**No.**, **Original Size**, **New Size**, **Space Saved**) with green/red row highlights and the saved destination folder path.
 - **PDF Format & Compatibility:**
   - **JPEG (`/DCTDecode`)**: Recommended for scanned homework and photos.
   - **PNG (`/FlateDecode` with PNG Predictor 15)**: Lossless PDF-native stream compression.
