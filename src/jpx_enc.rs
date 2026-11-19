@@ -1,3 +1,4 @@
+use smallvec::{smallvec, SmallVec};
 use std::sync::OnceLock;
 
 /// Level-shifted 2D sample precision used by PDF `/JPXDecode` streams (8 bits unsigned).
@@ -37,56 +38,154 @@ impl SubBandKind {
 }
 
 /// Encodes an 8-bit grayscale (`Luma8`) image into an ITU-T T.800 JPEG 2000 Part 1 codestream (`.j2k`).
+#[cold]
+fn cold_jpx_err(msg: String) -> String {
+    msg
+}
+
+const HDR10_LEVEL_SHIFT_LUT: [f32; 256] = {
+    let mut lut = [0.0f32; 256];
+    let mut i = 0usize;
+    while i < 256 {
+        lut[i] = (((i as u32) * 1023 + 127) / 255) as f32 - 512.0;
+        i += 1;
+    }
+    lut
+};
+
 pub fn encode_jpx_gray(gray: &[u8], width: u32, height: u32, quality: u8) -> Result<Vec<u8>, String> {
     if width == 0 || height == 0 {
-        return Err("JPEG 2000 width and height must be non-zero.".into());
+        return Err(cold_jpx_err("JPEG 2000 width and height must be non-zero.".into()));
     }
     let expected = (width as usize)
         .checked_mul(height as usize)
-        .ok_or_else(|| "JPEG 2000 dimensions overflow usize.".to_string())?;
+        .ok_or_else(|| cold_jpx_err("JPEG 2000 dimensions overflow usize.".to_string()))?;
     if gray.len() != expected {
-        return Err(format!(
+        return Err(cold_jpx_err(format!(
             "Grayscale buffer length {} does not match {width}x{height}.",
             gray.len()
-        ));
+        )));
     }
 
-    let comp0: Vec<f32> = gray.iter().map(|&p| (p as f32) - 128.0).collect();
-    encode_jpx_components(vec![comp0], width, height, quality, false)
+    let comp0: Vec<f32> = gray[..expected]
+        .iter()
+        .map(|&p| (p as f32) - 128.0)
+        .collect();
+    encode_jpx_components(smallvec![comp0], width, height, quality, false, BIT_DEPTH)
+}
+
+/// Encodes a 1-bit bi-level grayscale image (`0` = black, `>= 128` = white) into a 1-bit
+/// ITU-T T.800 JPEG 2000 Part 1 codestream (`Ssiz = 0`, 1 bpc).
+pub fn encode_jpx_bilevel_1bit(
+    gray: &[u8],
+    width: u32,
+    height: u32,
+    quality: u8,
+) -> Result<Vec<u8>, String> {
+    if width == 0 || height == 0 {
+        return Err(cold_jpx_err("JPEG 2000 width and height must be non-zero.".into()));
+    }
+    let expected = (width as usize)
+        .checked_mul(height as usize)
+        .ok_or_else(|| cold_jpx_err("JPEG 2000 dimensions overflow usize.".to_string()))?;
+    if gray.len() != expected {
+        return Err(cold_jpx_err(format!(
+            "1-bit grayscale buffer length {} does not match {width}x{height}.",
+            gray.len()
+        )));
+    }
+
+    // For bit_depth = 1, hayro-jpeg2000 / ITU-T T.800 applies level shift 1 << (1 - 1) = 1.0,
+    // mapping {0.0, 1.0} <-> {-1.0, 0.0}.
+    let comp0: Vec<f32> = gray[..expected]
+        .iter()
+        .map(|&p| if p >= 128 { 0.0 } else { -1.0 })
+        .collect();
+    encode_jpx_components(smallvec![comp0], width, height, quality, false, 1)
 }
 
 /// Encodes an 8-bit RGB (`Rgb8`) image into an ITU-T T.800 JPEG 2000 Part 1 codestream (`.j2k`)
 /// using the Irreversible Color Transform (ICT) + CDF 9/7 DWT + EBCOT arithmetic coding.
 pub fn encode_jpx_rgb(rgb: &[u8], width: u32, height: u32, quality: u8) -> Result<Vec<u8>, String> {
     if width == 0 || height == 0 {
-        return Err("JPEG 2000 width and height must be non-zero.".into());
+        return Err(cold_jpx_err("JPEG 2000 width and height must be non-zero.".into()));
     }
     let px = (width as usize)
         .checked_mul(height as usize)
-        .ok_or_else(|| "JPEG 2000 dimensions overflow usize.".to_string())?;
+        .ok_or_else(|| cold_jpx_err("JPEG 2000 dimensions overflow usize.".to_string()))?;
     let expected = px
         .checked_mul(3)
-        .ok_or_else(|| "JPEG 2000 RGB buffer overflows usize.".to_string())?;
+        .ok_or_else(|| cold_jpx_err("JPEG 2000 RGB buffer overflows usize.".to_string()))?;
     if rgb.len() != expected {
-        return Err(format!(
+        return Err(cold_jpx_err(format!(
             "RGB buffer length {} does not match {width}x{height}x3.",
             rgb.len()
-        ));
+        )));
     }
 
-    let mut y = Vec::with_capacity(px);
-    let mut cb = Vec::with_capacity(px);
-    let mut cr = Vec::with_capacity(px);
-    for chunk in rgb.chunks_exact(3) {
-        let r = (chunk[0] as f32) - 128.0;
-        let g = (chunk[1] as f32) - 128.0;
-        let b = (chunk[2] as f32) - 128.0;
-        y.push(0.299 * r + 0.587 * g + 0.114 * b);
-        cb.push(-0.168_736 * r - 0.331_264 * g + 0.5 * b);
-        cr.push(0.5 * r - 0.418_688 * g - 0.081_312 * b);
+    let src = &rgb[..expected];
+    let mut y = vec![0.0f32; px];
+    let mut cb = vec![0.0f32; px];
+    let mut cr = vec![0.0f32; px];
+    src.as_chunks::<3>()
+        .0
+        .iter()
+        .zip(y.iter_mut().zip(cb.iter_mut().zip(cr.iter_mut())))
+        .for_each(|(chunk, (yo, (cbo, cro)))| {
+            let r = (chunk[0] as f32) - 128.0;
+            let g = (chunk[1] as f32) - 128.0;
+            let b = (chunk[2] as f32) - 128.0;
+            *yo = 0.299 * r + 0.587 * g + 0.114 * b;
+            *cbo = -0.168_736 * r - 0.331_264 * g + 0.5 * b;
+            *cro = 0.5 * r - 0.418_688 * g - 0.081_312 * b;
+        });
+
+    encode_jpx_components(smallvec![y, cb, cr], width, height, quality, true, BIT_DEPTH)
+}
+
+/// Encodes an 8-bit RGB (`Rgb8`) image into a 10-bit-per-channel (`30-bit` HDR, `Ssiz = 9`)
+/// ITU-T T.800 JPEG 2000 Part 1 codestream using ICT + CDF 9/7 DWT + EBCOT.
+pub fn encode_jpx_rgb_10bit(
+    rgb: &[u8],
+    width: u32,
+    height: u32,
+    quality: u8,
+) -> Result<Vec<u8>, String> {
+    if width == 0 || height == 0 {
+        return Err(cold_jpx_err("JPEG 2000 width and height must be non-zero.".into()));
+    }
+    let px = (width as usize)
+        .checked_mul(height as usize)
+        .ok_or_else(|| cold_jpx_err("JPEG 2000 dimensions overflow usize.".to_string()))?;
+    let expected = px
+        .checked_mul(3)
+        .ok_or_else(|| cold_jpx_err("JPEG 2000 RGB buffer overflows usize.".to_string()))?;
+    if rgb.len() != expected {
+        return Err(cold_jpx_err(format!(
+            "RGB buffer length {} does not match {width}x{height}x3.",
+            rgb.len()
+        )));
     }
 
-    encode_jpx_components(vec![y, cb, cr], width, height, quality, true)
+    // Map 0..=255 -> 0..=1023, then subtract 10-bit level shift 512.0 via compile-time LUT.
+    let src = &rgb[..expected];
+    let mut y = vec![0.0f32; px];
+    let mut cb = vec![0.0f32; px];
+    let mut cr = vec![0.0f32; px];
+    src.as_chunks::<3>()
+        .0
+        .iter()
+        .zip(y.iter_mut().zip(cb.iter_mut().zip(cr.iter_mut())))
+        .for_each(|(chunk, (yo, (cbo, cro)))| {
+            let r = HDR10_LEVEL_SHIFT_LUT[chunk[0] as usize];
+            let g = HDR10_LEVEL_SHIFT_LUT[chunk[1] as usize];
+            let b = HDR10_LEVEL_SHIFT_LUT[chunk[2] as usize];
+            *yo = 0.299 * r + 0.587 * g + 0.114 * b;
+            *cbo = -0.168_736 * r - 0.331_264 * g + 0.5 * b;
+            *cro = 0.5 * r - 0.418_688 * g - 0.081_312 * b;
+        });
+
+    encode_jpx_components(smallvec![y, cb, cr], width, height, quality, true, 10)
 }
 
 /// Computes exact 1D CDF 9/7 synthesis impulse L2 norms `norms.0[d]` (lowpass depth d=0..=5)
@@ -148,11 +247,11 @@ fn dwt_97_1d_norms() -> &'static ([f64; 6], [f64; 6]) {
         let mut sig_l = vec![0.0f64; BUF_N];
         sig_l[BUF_N / 2] = 1.0;
         let mut cur_l = sig_l;
-        for d in 1..=5 {
+        for slot in low_norms.iter_mut().skip(1) {
             let z = vec![0.0f64; cur_l.len()];
             let half = idwt_1d_step(&cur_l, &z);
             let norm = half.iter().map(|v| v * v).sum::<f64>().sqrt();
-            low_norms[d] = norm;
+            *slot = norm;
             cur_l = half;
         }
 
@@ -162,10 +261,10 @@ fn dwt_97_1d_norms() -> &'static ([f64; 6], [f64; 6]) {
         let zeros = vec![0.0f64; BUF_N];
         let mut cur_h = idwt_1d_step(&zeros, &sig_h);
         high_norms[1] = cur_h.iter().map(|v| v * v).sum::<f64>().sqrt();
-        for d in 2..=5 {
+        for slot in high_norms.iter_mut().skip(2) {
             let z = vec![0.0f64; cur_h.len()];
             cur_h = idwt_1d_step(&cur_h, &z);
-            high_norms[d] = cur_h.iter().map(|v| v * v).sum::<f64>().sqrt();
+            *slot = cur_h.iter().map(|v| v * v).sum::<f64>().sqrt();
         }
 
         (low_norms, high_norms)
@@ -363,10 +462,10 @@ struct QuantStepParams {
     delta: f32,
 }
 
-fn encode_step_size(target_delta: f32, log_gain: u16) -> QuantStepParams {
-    let r_b = (BIT_DEPTH as u16) + log_gain;
+fn encode_step_size(target_delta: f32, log_gain: u16, bit_depth: u8) -> QuantStepParams {
+    let r_b = (bit_depth as u16) + log_gain;
     let scale_pow = (1u32 << r_b) as f64;
-    let clamped = (target_delta as f64).clamp(1.0 / 256.0, scale_pow * 0.99);
+    let clamped = (target_delta as f64).clamp(1.0 / 4096.0, scale_pow * 0.99);
     let val = clamped / scale_pow;
     let mut eps = (-val.log2().floor()) as i32;
     eps = eps.clamp(0, 24);
@@ -404,6 +503,7 @@ fn quantize_component(
     subbands: &[SubBandData],
     n_l: u8,
     base_step: f32,
+    bit_depth: u8,
 ) -> (u8, Vec<QuantStepParams>, Vec<QuantizedSubBand>) {
     let mut steps = Vec::with_capacity(subbands.len());
     let mut max_mags = Vec::with_capacity(subbands.len());
@@ -425,7 +525,7 @@ fn quantize_component(
             1.0
         };
         let target_delta = (base_step * csf_mult) / norm.max(0.25);
-        let qstep = encode_step_size(target_delta, sb.kind.log_gain());
+        let qstep = encode_step_size(target_delta, sb.kind.log_gain(), bit_depth);
         let inv_delta = 1.0 / qstep.delta;
 
         let mut mags = Vec::with_capacity(sb.coeffs.len());
@@ -815,10 +915,10 @@ impl CodeBlockScratch {
     fn encode_sign(&mut self, mq: &mut MqEncoder, padded_w: usize, x: u32, y: u32) {
         let i = Self::idx(padded_w, x, y);
         let sigs = self.neighbors[i] & 0b0101_0101;
-        let top_sign = self.signs[i - padded_w] as u8;
-        let left_sign = self.signs[i - 1] as u8;
-        let right_sign = self.signs[i + 1] as u8;
-        let bottom_sign = self.signs[i + padded_w] as u8;
+        let top_sign = self.signs[i - padded_w];
+        let left_sign = self.signs[i - 1];
+        let right_sign = self.signs[i + 1];
+        let bottom_sign = self.signs[i + padded_w];
 
         let packed_signs = (top_sign << 6) | (left_sign << 4) | (right_sign << 2) | bottom_sign;
         let neg_sigs = sigs & packed_signs;
@@ -1107,6 +1207,7 @@ impl TagTreeEncoder {
                 .max(height.next_power_of_two().ilog2()) as u16
         };
 
+        #[allow(clippy::too_many_arguments)]
         fn build(
             w: u32,
             h: u32,
@@ -1385,19 +1486,25 @@ fn write_qcd_payload(out: &mut Vec<u8>, guard_bits: u8, steps: &[QuantStepParams
 }
 
 fn encode_jpx_components(
-    components: Vec<Vec<f32>>,
+    components: SmallVec<[Vec<f32>; 3]>,
     width: u32,
     height: u32,
     quality: u8,
     use_mct: bool,
+    bit_depth: u8,
 ) -> Result<Vec<u8>, String> {
     let num_comps = components.len();
     // Single precinct per resolution requires width/height <= 16384; clamp decompositions safely.
     let n_l = (width.min(height).max(1).ilog2() as u8).min(MAX_DECOMP_LEVELS);
-    let base_step = quality_to_base_step(quality);
+    let depth_scale = 2.0_f32.powi((bit_depth as i32) - (BIT_DEPTH as i32));
+    let base_step = if bit_depth == 1 {
+        0.08
+    } else {
+        quality_to_base_step(quality) * depth_scale
+    };
 
-    let mut comp_qsteps = Vec::with_capacity(num_comps);
-    let mut comp_encoded_sbs = Vec::with_capacity(num_comps);
+    let mut comp_qsteps: SmallVec<[_; 3]> = SmallVec::with_capacity(num_comps);
+    let mut comp_encoded_sbs: SmallVec<[_; 3]> = SmallVec::with_capacity(num_comps);
     let mut scratch = CodeBlockScratch::new();
 
     for (comp_idx, comp_data) in components.into_iter().enumerate() {
@@ -1407,7 +1514,8 @@ fn encode_jpx_components(
             base_step
         };
         let dwt_sbs = forward_dwt_2d(comp_data, width, height, n_l);
-        let (guard_bits, qsteps, q_sbs) = quantize_component(&dwt_sbs, n_l, comp_step);
+        let (guard_bits, qsteps, q_sbs) =
+            quantize_component(&dwt_sbs, n_l, comp_step, bit_depth);
         let enc_sbs: Vec<EncodedSubBand> = q_sbs
             .iter()
             .map(|qsb| encode_subband(qsb, &mut scratch))
@@ -1457,7 +1565,7 @@ fn encode_jpx_components(
     codestream.extend_from_slice(&0u32.to_be_bytes()); // YTOsiz
     codestream.extend_from_slice(&(num_comps as u16).to_be_bytes()); // Csiz
     for _ in 0..num_comps {
-        codestream.extend_from_slice(&[BIT_DEPTH - 1, 1, 1]); // 8-bit unsigned, XRsiz=1, YRsiz=1
+        codestream.extend_from_slice(&[bit_depth.saturating_sub(1), 1, 1]); // unsigned bit_depth, XRsiz=1, YRsiz=1
     }
 
     // COD (Annex A.6.1)
@@ -1617,5 +1725,44 @@ mod tests {
         let encoded = encode_jpx_rgb(&rgb, w, h, 75).expect("encode noise j2k");
         let dec = decode_strict_j2k(&encoded);
         assert_eq!((dec.width(), dec.height()), (w, h));
+    }
+
+    #[test]
+    fn roundtrips_1bit_bilevel_and_10bit_hdr_under_strict_hayro_decode() {
+        let w = 64u32;
+        let h = 64u32;
+        let mut bw = vec![0u8; (w * h) as usize];
+        for y in 0..h {
+            for x in 0..w {
+                bw[(y * w + x) as usize] = if ((x / 8) + (y / 8)) % 2 == 0 {
+                    255
+                } else {
+                    0
+                };
+            }
+        }
+        let j2k_1bit = encode_jpx_bilevel_1bit(&bw, w, h, 85).expect("1-bit j2k");
+        let dec_1bit = decode_strict_j2k(&j2k_1bit);
+        assert_eq!((dec_1bit.width(), dec_1bit.height()), (w, h));
+
+        let mut hdr_rgb = vec![0u8; (w * h * 3) as usize];
+        for y in 0..h {
+            for x in 0..w {
+                let p = ((y * w + x) * 3) as usize;
+                hdr_rgb[p] = ((x * 255) / (w - 1)) as u8;
+                hdr_rgb[p + 1] = ((y * 255) / (h - 1)) as u8;
+                hdr_rgb[p + 2] = 160;
+            }
+        }
+        let j2k_10bit = encode_jpx_rgb_10bit(&hdr_rgb, w, h, 85).expect("10-bit hdr j2k");
+        let jpx_hdr = hayro_jpeg2000::Image::new(&j2k_10bit, &hayro_jpeg2000::DecodeSettings {
+            resolve_palette_indices: true,
+            strict: true,
+            target_resolution: None,
+        })
+        .expect("parse 10-bit hdr j2k");
+        assert_eq!(jpx_hdr.original_bit_depth(), 10);
+        let dec_10bit = DynamicImage::from_decoder(jpx_hdr).expect("decode 10-bit hdr j2k");
+        assert_eq!((dec_10bit.width(), dec_10bit.height()), (w, h));
     }
 }

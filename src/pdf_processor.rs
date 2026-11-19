@@ -1,10 +1,16 @@
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::io::{Read, Write};
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex, OnceLock};
 
 use flate2::{read::ZlibDecoder, write::ZlibEncoder, Compression};
+use hayro::hayro_interpret::InterpreterSettings;
+use hayro::hayro_syntax::Pdf as HayroPdf;
+use hayro::vello_cpu::color::palette::css::WHITE;
+use hayro::vello_cpu::peniko::ImageAlphaType;
+use hayro::{render as hayro_render, PixmapSettings, RenderCache, RenderSettings};
 use hayro_ccitt::{DecodeSettings as CcittDecodeSettings, DecoderContext as CcittDecoderContext, EncodingMode};
 use hayro_jbig2::{DecodeSettings as Jbig2DecodeSettings, File as Jbig2File, Globals as Jbig2Globals, Page as Jbig2Page};
 use hayro_jpeg2000::{ColorSpace as JpxColorSpace, DecodeSettings as JpxDecodeSettings, DecoderContext as JpxDecoderContext, Image as JpxImage};
@@ -14,11 +20,76 @@ use image::{
 };
 use lopdf::{dictionary, Dictionary, Document, Object, ObjectId, SaveOptions, Stream};
 use rayon::prelude::*;
-use sha2::{Digest, Sha256};
+use smallvec::{smallvec, SmallVec};
 use thiserror::Error;
 
-use crate::jpeg_enc::{decode_jpeg_to_image, encode_jpeg_gray, encode_jpeg_rgb};
-use crate::jpx_enc::{encode_jpx_gray, encode_jpx_rgb};
+use crate::jpeg_enc::{
+    decode_jpeg_to_image, encode_jpeg_gray, encode_jpeg_gray_fast_preview, encode_jpeg_rgb,
+    encode_jpeg_rgb_fast_preview,
+};
+use crate::jpx_enc::{
+    encode_jpx_bilevel_1bit, encode_jpx_gray, encode_jpx_rgb, encode_jpx_rgb_10bit,
+};
+
+static WORKER_POOL: OnceLock<rayon::ThreadPool> = OnceLock::new();
+
+/// Caps background CPU worker threads to 50% of logical cores (clamped to `1..=4`)
+/// so compression never starves the GUI or other running applications.
+pub fn worker_thread_count() -> usize {
+    std::thread::available_parallelism()
+        .map(|n| (n.get() / 2).clamp(1, 4))
+        .unwrap_or(2)
+}
+
+#[cfg(windows)]
+pub(crate) fn set_current_thread_below_normal() {
+    const THREAD_PRIORITY_BELOW_NORMAL: i32 = -1;
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn GetCurrentThread() -> *mut std::ffi::c_void;
+        fn SetThreadPriority(h_thread: *mut std::ffi::c_void, n_priority: i32) -> i32;
+    }
+    // SAFETY: `GetCurrentThread` returns a valid pseudo-handle for the calling thread and
+    // `SetThreadPriority` with `THREAD_PRIORITY_BELOW_NORMAL` is thread-safe.
+    unsafe {
+        let _ = SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+    }
+}
+
+#[cfg(unix)]
+pub(crate) fn set_current_thread_below_normal() {
+    extern "C" {
+        fn nice(inc: std::ffi::c_int) -> std::ffi::c_int;
+    }
+    // SAFETY: POSIX `nice(10)` lowers scheduling priority for the worker.
+    unsafe {
+        let _ = nice(10);
+    }
+}
+
+#[cfg(not(any(windows, unix)))]
+pub(crate) fn set_current_thread_below_normal() {}
+
+fn worker_pool() -> &'static rayon::ThreadPool {
+    const WORKER_STACK_BYTES: usize = 8 * 1024 * 1024;
+    WORKER_POOL.get_or_init(|| {
+        let threads = worker_thread_count();
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(threads)
+            .stack_size(WORKER_STACK_BYTES)
+            .thread_name(|idx| format!("pdf-worker-{idx}"))
+            .start_handler(|_| set_current_thread_below_normal())
+            .build()
+            .unwrap_or_else(|_| {
+                rayon::ThreadPoolBuilder::new()
+                    .num_threads(1)
+                    .stack_size(WORKER_STACK_BYTES)
+                    .start_handler(|_| set_current_thread_below_normal())
+                    .build()
+                    .expect("failed to construct fallback rayon thread pool")
+            })
+    })
+}
 
 /// Maximum uncompressed stream size (256 MiB) per image layer to guard against corrupt streams.
 const MAX_DECOMPRESSED_BYTES: usize = 256 * 1024 * 1024;
@@ -116,9 +187,73 @@ impl ResizeFilterChoice {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ColorDepth {
+    Bit1,
+    Gray8,
+    HighColor16,
+    #[default]
+    TrueColor24,
+    Hdr30,
+}
+
+impl ColorDepth {
+    pub const ALL: [Self; 5] = [
+        Self::Bit1,
+        Self::Gray8,
+        Self::HighColor16,
+        Self::TrueColor24,
+        Self::Hdr30,
+    ];
+    pub const JPEG_SUPPORTED: [Self; 2] = [Self::Gray8, Self::TrueColor24];
+    pub const PNG_SUPPORTED: [Self; 4] =
+        [Self::Bit1, Self::Gray8, Self::HighColor16, Self::TrueColor24];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Bit1 => "Black/White (1-bit)",
+            Self::Gray8 => "Grayscale (8-bit)",
+            Self::HighColor16 => "High Color (16-bit)",
+            Self::TrueColor24 => "True Color (24-bit)",
+            Self::Hdr30 => "HDR (30-bit)",
+        }
+    }
+
+    pub fn supported_for(format: ImageFormatChoice) -> &'static [Self] {
+        match format {
+            ImageFormatChoice::Jpeg => &Self::JPEG_SUPPORTED,
+            ImageFormatChoice::Jpeg2000 => &Self::ALL,
+            ImageFormatChoice::Png => &Self::PNG_SUPPORTED,
+        }
+    }
+
+    pub fn is_supported_by(self, format: ImageFormatChoice) -> bool {
+        Self::supported_for(format).contains(&self)
+    }
+
+    pub fn fallback_for(self, format: ImageFormatChoice) -> Self {
+        if self.is_supported_by(format) {
+            self
+        } else {
+            Self::TrueColor24
+        }
+    }
+
+    pub fn bitrate_multiplier(self) -> f64 {
+        match self {
+            Self::Bit1 => 0.08,
+            Self::Gray8 => 0.42,
+            Self::HighColor16 => 0.72,
+            Self::TrueColor24 => 1.00,
+            Self::Hdr30 => 1.35,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct CompressionOptions {
     pub format: ImageFormatChoice,
+    pub color_depth: ColorDepth,
     pub quality: u8,
     pub scale: f32,
     pub resize_filter: ResizeFilterChoice,
@@ -128,6 +263,7 @@ impl Default for CompressionOptions {
     fn default() -> Self {
         Self {
             format: ImageFormatChoice::Jpeg,
+            color_depth: ColorDepth::TrueColor24,
             quality: 100,
             scale: 1.00,
             resize_filter: ResizeFilterChoice::Lanczos3,
@@ -138,6 +274,7 @@ impl Default for CompressionOptions {
 #[derive(Debug, Clone)]
 pub struct PdfSummary {
     pub page_count: usize,
+    #[cfg(test)]
     pub image_count: usize,
     pub compressible_image_count: usize,
     #[cfg(test)]
@@ -169,6 +306,7 @@ impl Default for PdfSummary {
     fn default() -> Self {
         Self {
             page_count: 0,
+            #[cfg(test)]
             image_count: 0,
             compressible_image_count: 0,
             #[cfg(test)]
@@ -254,11 +392,18 @@ impl PdfSummary {
             ResizeFilterChoice::CatmullRom => 0.96,
         };
 
+        let depth_mult = options
+            .color_depth
+            .fallback_for(options.format)
+            .bitrate_multiplier();
+
         let image_bytes = match options.format {
             ImageFormatChoice::Jpeg => {
                 let q = options.quality.clamp(1, 100);
                 let q_mult = jpeg_quality_multiplier(q);
-                let bpp_rgb = (self.sample_rgb_jpeg_q50_bpp * q_mult * filter_mult).clamp(0.06, 10.5);
+                let bpp_rgb =
+                    (self.sample_rgb_jpeg_q50_bpp * q_mult * filter_mult).clamp(0.06, 10.5)
+                        * depth_mult;
 
                 let scaled_dct_rgb = (self.orig_dct_rgb_pixels as f64) * scale_sq;
                 let scaled_dct_gray = (self.orig_dct_gray_pixels as f64) * scale_sq;
@@ -266,6 +411,7 @@ impl PdfSummary {
                 let dct_raw_est = dct_eff_pixels * (bpp_rgb / 8.0)
                     + (self.orig_dct_image_count as f64) * 320.0;
                 let dct_est = if apply_orig_dct_cap
+                    && options.color_depth == ColorDepth::TrueColor24
                     && (scale - 1.0).abs() < 1e-4
                     && self.orig_dct_bytes > 0
                 {
@@ -296,14 +442,16 @@ impl PdfSummary {
                 let q = options.quality.clamp(1, 100);
                 let q_mult = jpeg_quality_multiplier(q);
                 let bpp_rgb =
-                    (self.sample_rgb_jpeg_q50_bpp * 0.78 * q_mult * filter_mult).clamp(0.045, 9.0);
+                    (self.sample_rgb_jpeg_q50_bpp * 0.78 * q_mult * filter_mult).clamp(0.045, 9.0)
+                        * depth_mult;
                 let eff_pixels = ((self.compressible_rgb_pixels as f64)
                     + GRAY_TO_RGB_JPEG_RATIO * (self.compressible_gray_pixels as f64))
                     * scale_sq;
                 eff_pixels * (bpp_rgb / 8.0) + (self.compressible_image_count as f64) * 380.0
             }
             ImageFormatChoice::Png => {
-                let bpp_rgb = (self.sample_rgb_flate_bpp * filter_mult).clamp(0.35, 24.0);
+                let bpp_rgb =
+                    (self.sample_rgb_flate_bpp * filter_mult).clamp(0.35, 24.0) * depth_mult;
                 let eff_pixels = ((self.compressible_rgb_pixels as f64)
                     + GRAY_TO_RGB_FLATE_RATIO * (self.compressible_gray_pixels as f64))
                     * scale_sq;
@@ -474,6 +622,7 @@ pub struct CompressionStats {
     #[cfg(test)]
     pub objects_deduplicated: usize,
     pub flate_streams_recompressed: usize,
+    pub(crate) payload_stream_bytes: usize,
     pub skipped_reasons: Vec<String>,
 }
 
@@ -548,6 +697,41 @@ enum ColorSpaceSpec<'a> {
 #[derive(Debug)]
 enum SkipReason {
     Unsupported(String),
+}
+
+type FilterChain<'a> = SmallVec<[&'a [u8]; 4]>;
+type DecodeArray = SmallVec<[f64; 8]>;
+
+#[derive(Default)]
+struct ImageEncodeScratch {
+    png_buf: Vec<u8>,
+    bit1_buf: Vec<u8>,
+}
+
+#[derive(Default)]
+struct FlateScratch {
+    decoded: Vec<u8>,
+    compressed: Vec<u8>,
+}
+
+#[cold]
+fn skip_unsupported(msg: String) -> SkipReason {
+    SkipReason::Unsupported(msg)
+}
+
+#[cold]
+fn skip_unsupported_str(msg: &str) -> SkipReason {
+    SkipReason::Unsupported(msg.to_owned())
+}
+
+#[cold]
+fn pdf_encode_err(msg: String) -> PdfError {
+    PdfError::ImageEncode(msg)
+}
+
+#[cold]
+fn pdf_parse_err(msg: String) -> PdfError {
+    PdfError::Parse(msg)
 }
 
 /// Collects unique, deduplicated candidate Image XObject IDs reachable across pages, annotations,
@@ -818,21 +1002,77 @@ fn collect_images_from_appearance_entry(
 struct StructureOptReport {
     gc_removed: usize,
     dedup_merged: usize,
-    cached_flate_decoded: HashMap<ObjectId, Vec<u8>>,
 }
 
-fn zlib_decompress_with_limit(raw: &[u8], max_bytes: usize) -> Option<Vec<u8>> {
+fn zlib_decompress_into_with_limit(raw: &[u8], max_bytes: usize, out: &mut Vec<u8>) -> bool {
+    out.clear();
     let mut dec = ZlibDecoder::new(raw);
-    let mut out = Vec::new();
     dec.by_ref()
         .take((max_bytes + 1) as u64)
-        .read_to_end(&mut out)
-        .ok()?;
-    if out.len() <= max_bytes {
-        Some(out)
-    } else {
-        None
+        .read_to_end(out)
+        .is_ok()
+        && out.len() <= max_bytes
+}
+
+#[derive(Clone, Copy)]
+struct FastHasher128 {
+    lo: u64,
+    hi: u64,
+}
+
+impl FastHasher128 {
+    fn new() -> Self {
+        Self {
+            lo: 0xcbf2_9ce4_8422_2325,
+            hi: 0x9e37_79b9_7f4a_7c15,
+        }
     }
+
+    #[inline]
+    fn update(&mut self, bytes: impl AsRef<[u8]>) {
+        self.update_bytes(bytes.as_ref());
+    }
+
+    fn update_bytes(&mut self, data: &[u8]) {
+        let mut lo = self.lo;
+        let mut hi = self.hi;
+        data.iter().for_each(|&b| {
+            let v = u64::from(b);
+            lo ^= v;
+            lo = lo.wrapping_mul(0x0100_0000_01b3);
+            hi = hi.rotate_left(13) ^ v.wrapping_mul(0x9e37_79b1_85eb_ca87);
+            hi = hi.wrapping_mul(0xc2b2_ae3d_27d4_eb4f);
+        });
+        lo ^= (data.len() as u64).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        self.lo = lo;
+        self.hi = hi;
+    }
+
+    fn finalize(self) -> [u8; 16] {
+        let mut out = [0u8; 16];
+        out[..8].copy_from_slice(&self.lo.to_le_bytes());
+        out[8..].copy_from_slice(&self.hi.to_le_bytes());
+        out
+    }
+}
+
+fn zlib_hash_with_limit(raw: &[u8], max_bytes: usize) -> Option<(u64, [u8; 16])> {
+    let mut dec = ZlibDecoder::new(raw);
+    let mut hasher = FastHasher128::new();
+    let mut buf = [0u8; 32 * 1024];
+    let mut total = 0usize;
+    loop {
+        let n = dec.read(&mut buf).ok()?;
+        if n == 0 {
+            break;
+        }
+        total = total.checked_add(n)?;
+        if total > max_bytes {
+            return None;
+        }
+        hasher.update(&buf[..n]);
+    }
+    Some((total as u64, hasher.finalize()))
 }
 
 fn push_refs_from_object(obj: &Object, queue: &mut Vec<ObjectId>, seen: &mut HashSet<ObjectId>) {
@@ -957,7 +1197,7 @@ fn rewrite_all_references(
     dirty_ids
 }
 
-fn hash_object_value_canonical(obj: &Object, hasher: &mut Sha256, depth: usize) {
+fn hash_object_value_canonical(obj: &Object, hasher: &mut FastHasher128, depth: usize) {
     if depth > 64 {
         hasher.update(b"DMAX");
         return;
@@ -1013,7 +1253,7 @@ fn hash_object_value_canonical(obj: &Object, hasher: &mut Sha256, depth: usize) 
 
 fn hash_dict_entries_canonical(
     dict: &Dictionary,
-    hasher: &mut Sha256,
+    hasher: &mut FastHasher128,
     skip_keys: &[&[u8]],
     depth: usize,
 ) {
@@ -1056,14 +1296,14 @@ fn is_non_mergeable_object(doc: &Document, obj: &Object) -> bool {
 struct CachedStreamPayload {
     content_tag: &'static [u8],
     payload_len: u64,
-    payload_digest: [u8; 32],
+    payload_digest: [u8; 16],
     normalize_flate: bool,
     prefer_rank: u8,
     raw_len: usize,
 }
 
-fn combine_stream_hash(dict: &Dictionary, payload: &CachedStreamPayload) -> [u8; 32] {
-    let mut hasher = Sha256::new();
+fn combine_stream_hash(dict: &Dictionary, payload: &CachedStreamPayload) -> [u8; 16] {
+    let mut hasher = FastHasher128::new();
     hasher.update(b"STREAM");
     if payload.normalize_flate {
         hash_dict_entries_canonical(dict, &mut hasher, &[b"Length", b"Filter"], 1);
@@ -1073,14 +1313,13 @@ fn combine_stream_hash(dict: &Dictionary, payload: &CachedStreamPayload) -> [u8;
     hasher.update(payload.content_tag);
     hasher.update(payload.payload_len.to_le_bytes());
     hasher.update(payload.payload_digest);
-    hasher.finalize().into()
+    hasher.finalize()
 }
 
 fn hash_canonical_object_for_dedup(
     doc: &Document,
     obj: &Object,
-    keep_flate_payload: bool,
-) -> Option<([u8; 32], u8, usize, Option<CachedStreamPayload>, Option<Vec<u8>>)> {
+) -> Option<([u8; 16], u8, usize, Option<CachedStreamPayload>)> {
     if is_non_mergeable_object(doc, obj) {
         return None;
     }
@@ -1098,47 +1337,38 @@ fn hash_canonical_object_for_dedup(
                 )
             });
 
-            let mut retained_flate: Option<Vec<u8>> = None;
-            let (content_tag, logical_bytes): (&'static [u8], Cow<'_, [u8]>) = if filters.is_empty() {
-                (b"D", Cow::Borrowed(&stream.content))
-            } else if is_image_codec_stream {
-                (b"R", Cow::Borrowed(&stream.content))
-            } else if is_single_flate && !has_parms {
-                if let Some(decoded) = zlib_decompress_with_limit(&stream.content, MAX_DECOMPRESSED_BYTES) {
-                    (b"D", Cow::Owned(decoded))
+            let (content_tag, payload_len, payload_digest): (&'static [u8], u64, [u8; 16]) =
+                if filters.is_empty() || is_image_codec_stream {
+                    let tag = if filters.is_empty() { b"D" } else { b"R" };
+                    let mut hasher = FastHasher128::new();
+                    hasher.update(&stream.content);
+                    (tag, stream.content.len() as u64, hasher.finalize())
+                } else if is_single_flate && !has_parms {
+                    if let Some((len, digest)) =
+                        zlib_hash_with_limit(&stream.content, MAX_DECOMPRESSED_BYTES)
+                    {
+                        (b"D", len, digest)
+                    } else {
+                        let mut hasher = FastHasher128::new();
+                        hasher.update(&stream.content);
+                        (b"R", stream.content.len() as u64, hasher.finalize())
+                    }
+                } else if let Ok(decoded) =
+                    stream.decompressed_content_with_limit(MAX_DECOMPRESSED_BYTES)
+                {
+                    let mut hasher = FastHasher128::new();
+                    hasher.update(&decoded);
+                    (b"D", decoded.len() as u64, hasher.finalize())
                 } else {
-                    (b"R", Cow::Borrowed(&stream.content))
-                }
-            } else if let Ok(decoded) =
-                stream.decompressed_content_with_limit(MAX_DECOMPRESSED_BYTES)
-            {
-                (b"D", Cow::Owned(decoded))
-            } else {
-                (b"R", Cow::Borrowed(&stream.content))
-            };
+                    let mut hasher = FastHasher128::new();
+                    hasher.update(&stream.content);
+                    (b"R", stream.content.len() as u64, hasher.finalize())
+                };
 
             let normalize_flate = !has_parms
                 && content_tag == b"D"
                 && (filters.is_empty() || is_single_flate);
             let prefer_rank = if is_single_flate { 0 } else { 1 };
-
-            let mut payload_hasher = Sha256::new();
-            payload_hasher.update(&logical_bytes);
-            let payload_digest: [u8; 32] = payload_hasher.finalize().into();
-            let payload_len = logical_bytes.len() as u64;
-
-            if keep_flate_payload
-                && is_single_flate
-                && !has_parms
-                && content_tag == b"D"
-                && stream.allows_compression
-                && !stream.content.is_empty()
-                && !is_metadata_stream(doc, stream)
-            {
-                if let Cow::Owned(decoded_vec) = logical_bytes {
-                    retained_flate = Some(decoded_vec);
-                }
-            }
 
             let cached_payload = CachedStreamPayload {
                 content_tag,
@@ -1149,64 +1379,59 @@ fn hash_canonical_object_for_dedup(
                 raw_len,
             };
             let digest = combine_stream_hash(&stream.dict, &cached_payload);
-            Some((digest, prefer_rank, raw_len, Some(cached_payload), retained_flate))
+            Some((digest, prefer_rank, raw_len, Some(cached_payload)))
         }
         other => {
-            let mut hasher = Sha256::new();
+            let mut hasher = FastHasher128::new();
             hasher.update(b"OBJ");
             hash_object_value_canonical(other, &mut hasher, 1);
-            let digest: [u8; 32] = hasher.finalize().into();
-            Some((digest, 1u8, 0usize, None, None))
+            let digest: [u8; 16] = hasher.finalize();
+            Some((digest, 1u8, 0usize, None))
         }
     }
 }
 
+type InitialDedupEntry = (ObjectId, [u8; 16], u8, usize, Option<CachedStreamPayload>);
+
 /// Iteratively merges identical streams, dictionaries (fonts, ExtGState, ColorSpace, encodings),
 /// and arrays across the document until fixed-point convergence.
-fn deduplicate_objects_iterative(
-    doc: &mut Document,
-    keep_flate_payloads: bool,
-) -> (usize, HashMap<ObjectId, Vec<u8>>) {
+fn deduplicate_objects_iterative(doc: &mut Document, parallel: bool) -> usize {
     let mut total_merged = 0usize;
 
-    let initial: Vec<(
-        ObjectId,
-        [u8; 32],
-        u8,
-        usize,
-        Option<CachedStreamPayload>,
-        Option<Vec<u8>>,
-    )> = {
-        let doc_ref = &*doc;
+    let initial: Vec<InitialDedupEntry> = if parallel {
+        worker_pool().install(|| {
+            let doc_ref = &*doc;
+            doc.objects
+                .par_iter()
+                .filter_map(|(&id, obj)| {
+                    hash_canonical_object_for_dedup(doc_ref, obj)
+                        .map(|(hash, pref, raw_len, payload)| (id, hash, pref, raw_len, payload))
+                })
+                .collect()
+        })
+    } else {
         doc.objects
-            .par_iter()
+            .iter()
             .filter_map(|(&id, obj)| {
-                hash_canonical_object_for_dedup(doc_ref, obj, keep_flate_payloads).map(
-                    |(hash, pref, raw_len, payload, decoded)| {
-                        (id, hash, pref, raw_len, payload, decoded)
-                    },
-                )
+                hash_canonical_object_for_dedup(doc, obj)
+                    .map(|(hash, pref, raw_len, payload)| (id, hash, pref, raw_len, payload))
             })
             .collect()
     };
 
-    let mut object_hashes: HashMap<ObjectId, ([u8; 32], u8, usize)> =
+    let mut object_hashes: HashMap<ObjectId, ([u8; 16], u8, usize)> =
         HashMap::with_capacity(initial.len());
     let mut stream_payloads: HashMap<ObjectId, CachedStreamPayload> = HashMap::new();
-    let mut flate_decoded: HashMap<ObjectId, Vec<u8>> = HashMap::new();
 
-    for (id, hash, pref, raw_len, payload, decoded) in initial {
+    for (id, hash, pref, raw_len, payload) in initial {
         object_hashes.insert(id, (hash, pref, raw_len));
         if let Some(p) = payload {
             stream_payloads.insert(id, p);
         }
-        if let Some(d) = decoded {
-            flate_decoded.insert(id, d);
-        }
     }
 
     for _round in 0..16 {
-        let mut entries: Vec<(ObjectId, [u8; 32], u8, usize)> = object_hashes
+        let mut entries: Vec<(ObjectId, [u8; 16], u8, usize)> = object_hashes
             .iter()
             .map(|(&id, &(hash, pref, raw_len))| (id, hash, pref, raw_len))
             .collect();
@@ -1216,7 +1441,7 @@ fn deduplicate_objects_iterative(
             a.2.cmp(&b.2).then_with(|| a.3.cmp(&b.3)).then_with(|| a.0.cmp(&b.0))
         });
 
-        let mut seen: HashMap<[u8; 32], ObjectId> = HashMap::with_capacity(entries.len());
+        let mut seen: HashMap<[u8; 16], ObjectId> = HashMap::with_capacity(entries.len());
         let mut redirect: HashMap<ObjectId, ObjectId> = HashMap::new();
 
         for (id, hash, _, _) in entries {
@@ -1239,7 +1464,6 @@ fn deduplicate_objects_iterative(
             doc.objects.remove(dup_id);
             object_hashes.remove(dup_id);
             stream_payloads.remove(dup_id);
-            flate_decoded.remove(dup_id);
         }
 
         if dirty_ids.is_empty() {
@@ -1262,24 +1486,28 @@ fn deduplicate_objects_iterative(
                     }
                 }
                 other => {
-                    let mut hasher = Sha256::new();
+                    let mut hasher = FastHasher128::new();
                     hasher.update(b"OBJ");
                     hash_object_value_canonical(other, &mut hasher, 1);
-                    let hash: [u8; 32] = hasher.finalize().into();
+                    let hash: [u8; 16] = hasher.finalize();
                     object_hashes.insert(dirty_id, (hash, 1u8, 0usize));
                 }
             }
         }
     }
 
-    (total_merged, flate_decoded)
+    total_merged
 }
 
 /// Runs Priority 1 structural cleanup: strips trailer stale keys, performs reachability garbage
 /// collection from `/Root` and `/Info`, and deduplicates identical streams and dictionaries.
-fn optimize_structure_gc_and_dedup(
+fn optimize_structure_gc_and_dedup(doc: &mut Document) -> StructureOptReport {
+    optimize_structure_gc_and_dedup_with_mode(doc, true)
+}
+
+fn optimize_structure_gc_and_dedup_with_mode(
     doc: &mut Document,
-    keep_flate_payloads: bool,
+    parallel: bool,
 ) -> StructureOptReport {
     if !doc.is_encrypted() {
         doc.trailer.remove(b"Encrypt");
@@ -1289,14 +1517,8 @@ fn optimize_structure_gc_and_dedup(
 
     let mut report = StructureOptReport::default();
     report.gc_removed += garbage_collect_unreachable_objects(doc);
-    let (merged, mut cached_flate_decoded) =
-        deduplicate_objects_iterative(doc, keep_flate_payloads);
-    report.dedup_merged += merged;
+    report.dedup_merged += deduplicate_objects_iterative(doc, parallel);
     report.gc_removed += garbage_collect_unreachable_objects(doc);
-    if !cached_flate_decoded.is_empty() {
-        cached_flate_decoded.retain(|id, _| doc.objects.contains_key(id));
-    }
-    report.cached_flate_decoded = cached_flate_decoded;
     report
 }
 
@@ -1304,113 +1526,127 @@ fn is_metadata_stream(doc: &Document, stream: &Stream) -> bool {
     dict_get_resolved(doc, &stream.dict, b"Type").and_then(obj_as_name) == Some(b"Metadata")
 }
 
+fn try_recompress_flate_or_raw_stream(
+    doc: &Document,
+    id: ObjectId,
+    is_flate: bool,
+    scratch: &mut FlateScratch,
+) -> Option<(ObjectId, Vec<u8>, bool)> {
+    let Object::Stream(stream) = doc.objects.get(&id)? else {
+        return None;
+    };
+    let raw = stream.content.as_slice();
+    if is_flate {
+        // Decode raw zlib stream directly without stripping /DecodeParms predictors
+        // so re-compression remains bit-exact with existing /DecodeParms dictionaries.
+        if !zlib_decompress_into_with_limit(raw, MAX_DECOMPRESSED_BYTES, &mut scratch.decoded) {
+            return None;
+        }
+        scratch.compressed.clear();
+        let mut enc = ZlibEncoder::new(&mut scratch.compressed, Compression::best());
+        enc.write_all(&scratch.decoded).ok()?;
+        enc.finish().ok()?;
+        if scratch.compressed.len() < raw.len() {
+            Some((id, std::mem::take(&mut scratch.compressed), false))
+        } else {
+            None
+        }
+    } else {
+        scratch.compressed.clear();
+        let mut enc = ZlibEncoder::new(&mut scratch.compressed, Compression::best());
+        enc.write_all(raw).ok()?;
+        enc.finish().ok()?;
+        if scratch.compressed.len() + 19 < raw.len() {
+            Some((id, std::mem::take(&mut scratch.compressed), true))
+        } else {
+            None
+        }
+    }
+}
+
+fn apply_recompressed_flate_update(
+    doc: &mut Document,
+    id: ObjectId,
+    compressed: Vec<u8>,
+    add_filter: bool,
+) -> bool {
+    if let Some(Object::Stream(stream)) = doc.objects.get_mut(&id) {
+        let _ = std::mem::take(&mut stream.content);
+        stream.set_content(compressed);
+        if add_filter {
+            stream.dict.set("Filter", "FlateDecode");
+        }
+        true
+    } else {
+        false
+    }
+}
+
 /// Priority 3: Re-compresses `/FlateDecode` streams (preserving any `/DecodeParms`) and
 /// compresses uncompressed non-metadata streams using highest-ratio zlib (`Compression::best()`),
 /// guarded strictly so only smaller streams replace the originals.
-fn recompress_flate_and_raw_streams(
-    doc: &mut Document,
-    mut cached_flate_decoded: HashMap<ObjectId, Vec<u8>>,
-) -> usize {
-    enum StreamTaskPayload<'a> {
-        RecompressFlate {
-            raw: &'a [u8],
-            pre_decoded: Option<Vec<u8>>,
-        },
-        CompressRaw {
-            raw: &'a [u8],
-        },
+fn recompress_flate_and_raw_streams(doc: &mut Document, parallel: bool) -> usize {
+    let candidates: Vec<(ObjectId, bool)> = doc
+        .objects
+        .iter()
+        .filter_map(|(&id, obj)| {
+            let Object::Stream(stream) = obj else {
+                return None;
+            };
+            if !stream.allows_compression || is_metadata_stream(doc, stream) {
+                return None;
+            }
+            let type_name = dict_get_resolved(doc, &stream.dict, b"Type").and_then(obj_as_name);
+            if matches!(type_name, Some(b"ObjStm" | b"XRef")) {
+                return None;
+            }
+            let filters = extract_filters(doc, &stream.dict).ok()?;
+            if filters.len() == 1 && filters[0] == b"FlateDecode" && !stream.content.is_empty() {
+                Some((id, true))
+            } else if filters.is_empty() && stream.content.len() > 24 {
+                Some((id, false))
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    let mut updated_count = 0usize;
+    if !parallel {
+        let mut scratch = FlateScratch::default();
+        for (id, is_flate) in candidates {
+            if let Some((oid, compressed, add_filter)) =
+                try_recompress_flate_or_raw_stream(doc, id, is_flate, &mut scratch)
+            {
+                if apply_recompressed_flate_update(doc, oid, compressed, add_filter) {
+                    updated_count += 1;
+                }
+            }
+        }
+        return updated_count;
     }
 
-    let updates: Vec<(ObjectId, Vec<u8>, bool)> = {
-        let candidates: Vec<(ObjectId, StreamTaskPayload<'_>)> = doc
-            .objects
-            .iter()
-            .filter_map(|(&id, obj)| {
-                let Object::Stream(stream) = obj else {
-                    return None;
-                };
-                if !stream.allows_compression || is_metadata_stream(doc, stream) {
-                    return None;
-                }
-                let type_name = dict_get_resolved(doc, &stream.dict, b"Type").and_then(obj_as_name);
-                if matches!(type_name, Some(b"ObjStm" | b"XRef")) {
-                    return None;
-                }
-                let filters = extract_filters(doc, &stream.dict).ok()?;
-                if filters.len() == 1 && filters[0] == b"FlateDecode" && !stream.content.is_empty()
-                {
-                    let pre_decoded = if stream.dict.has(b"DecodeParms") {
-                        None
-                    } else {
-                        cached_flate_decoded.remove(&id)
-                    };
-                    Some((
-                        id,
-                        StreamTaskPayload::RecompressFlate {
-                            raw: stream.content.as_slice(),
-                            pre_decoded,
-                        },
-                    ))
-                } else if filters.is_empty() && stream.content.len() > 24 {
-                    Some((
-                        id,
-                        StreamTaskPayload::CompressRaw {
-                            raw: stream.content.as_slice(),
-                        },
-                    ))
-                } else {
-                    None
-                }
-            })
-            .collect();
+    let chunk_size = worker_thread_count().max(1);
+    for chunk in candidates.chunks(chunk_size) {
+        let updates: Vec<(ObjectId, Vec<u8>, bool)> = worker_pool().install(|| {
+            let doc_ref = &*doc;
+            chunk
+                .par_iter()
+                .map_init(FlateScratch::default, |scratch, &(id, is_flate)| {
+                    try_recompress_flate_or_raw_stream(doc_ref, id, is_flate, scratch)
+                })
+                .flatten()
+                .collect()
+        });
 
-        candidates
-            .par_iter()
-            .filter_map(|(id, task)| match task {
-                StreamTaskPayload::RecompressFlate { raw, pre_decoded } => {
-                    let owned_decoded;
-                    let decoded_slice: &[u8] = match pre_decoded {
-                        Some(buf) => buf.as_slice(),
-                        None => {
-                            // Decode raw zlib stream directly without stripping /DecodeParms predictors
-                            // so re-compression remains bit-exact with existing /DecodeParms dictionaries.
-                            owned_decoded = zlib_decompress_with_limit(raw, MAX_DECOMPRESSED_BYTES)?;
-                            owned_decoded.as_slice()
-                        }
-                    };
-                    let mut enc = ZlibEncoder::new(Vec::new(), Compression::best());
-                    enc.write_all(decoded_slice).ok()?;
-                    let recompressed = enc.finish().ok()?;
-                    if recompressed.len() < raw.len() {
-                        Some((*id, recompressed, false))
-                    } else {
-                        None
-                    }
-                }
-                StreamTaskPayload::CompressRaw { raw } => {
-                    let mut enc = ZlibEncoder::new(Vec::new(), Compression::best());
-                    enc.write_all(raw).ok()?;
-                    let compressed = enc.finish().ok()?;
-                    if compressed.len() + 19 < raw.len() {
-                        Some((*id, compressed, true))
-                    } else {
-                        None
-                    }
-                }
-            })
-            .collect()
-    };
-
-    let count = updates.len();
-    for (id, compressed, add_filter) in updates {
-        if let Some(Object::Stream(stream)) = doc.objects.get_mut(&id) {
-            stream.set_content(compressed);
-            if add_filter {
-                stream.dict.set("Filter", "FlateDecode");
+        for (id, compressed, add_filter) in updates {
+            if apply_recompressed_flate_update(doc, id, compressed, add_filter) {
+                updated_count += 1;
             }
         }
     }
-    count
+
+    updated_count
 }
 
 fn ensure_min_pdf_version(doc: &mut Document, min_major: u32, min_minor: u32) {
@@ -1639,19 +1875,31 @@ fn is_bilevel_1bit_stream(doc: &Document, stream: &Stream) -> bool {
     is_bilevel_codec && explicit_bpc != Some(8)
 }
 
+/// Inspects a PDF file on disk one document at a time and immediately drops the parsed
+/// `lopdf::Document` before returning lightweight summary metadata.
+pub fn inspect_pdf_path(path: &Path) -> Result<PdfSummary, PdfError> {
+    let (doc, file_bytes) = load_unencrypted_document_from_path(path)?;
+    inspect_document(doc, file_bytes)
+}
+
 /// Inspects a PDF in memory using the same reachability GC and hash deduplication pass as the
 /// compressor, partitioning unique 1-bit/fixed streams, compressible (>=8-bit) raster images,
 /// non-image `/FlateDecode` streams, and structural dictionary overhead for fast O(1) UI sizing.
 pub fn inspect_pdf(input_bytes: &[u8]) -> Result<PdfSummary, PdfError> {
-    let mut doc = load_unencrypted_document(input_bytes)?;
+    let doc = load_unencrypted_document(input_bytes)?;
+    inspect_document(doc, input_bytes.len())
+}
+
+fn inspect_document(mut doc: Document, file_bytes: usize) -> Result<PdfSummary, PdfError> {
     #[cfg(test)]
-    let opt_report = optimize_structure_gc_and_dedup(&mut doc, false);
+    let opt_report = optimize_structure_gc_and_dedup(&mut doc);
     #[cfg(not(test))]
-    let _ = optimize_structure_gc_and_dedup(&mut doc, false);
+    let _ = optimize_structure_gc_and_dedup(&mut doc);
 
     let page_count = doc.get_pages().len();
     let candidate_ids = collect_candidate_image_ids(&doc);
 
+    #[cfg(test)]
     let mut image_count = 0usize;
     let mut compressible_image_count = 0usize;
     #[cfg(test)]
@@ -1683,7 +1931,10 @@ pub fn inspect_pdf(input_bytes: &[u8]) -> Result<PdfSummary, PdfError> {
             continue;
         }
 
-        image_count += 1;
+        #[cfg(test)]
+        {
+            image_count += 1;
+        }
 
         let smask_ref_id = match stream.dict.get(b"SMask") {
             Ok(Object::Reference(ref_id)) => Some(*ref_id),
@@ -1863,11 +2114,12 @@ pub fn inspect_pdf(input_bytes: &[u8]) -> Result<PdfSummary, PdfError> {
 
     Ok(PdfSummary {
         page_count,
+        #[cfg(test)]
         image_count,
         compressible_image_count,
         #[cfg(test)]
         skipped_1bit_count,
-        file_bytes: input_bytes.len(),
+        file_bytes,
         non_image_overhead_bytes,
         #[cfg(test)]
         fixed_image_bytes,
@@ -1928,7 +2180,7 @@ fn calibrate_sample_image(sample_img: &DynamicImage, orig_w: u32, orig_h: u32) -
 fn inspect_compressible_metadata<'a>(
     doc: &'a Document,
     stream: &'a Stream,
-) -> Option<(u32, u32, bool, Vec<&'a [u8]>)> {
+) -> Option<(u32, u32, bool, FilterChain<'a>)> {
     if is_bilevel_1bit_stream(doc, stream) {
         return None;
     }
@@ -1975,16 +2227,25 @@ struct ImageCompressionJob {
     target_hint: Option<(u32, u32)>,
 }
 
+struct PreparedSmask {
+    id: ObjectId,
+    width: u32,
+    height: u32,
+    encoded: EncodedPdfStream,
+}
+
+struct RecompressedImageData {
+    id: ObjectId,
+    new_w: u32,
+    new_h: u32,
+    encoded: EncodedPdfStream,
+    keep_smask: bool,
+    keep_mask: bool,
+    prepared_smask: Option<Box<PreparedSmask>>,
+}
+
 enum ImageCompressionOutcome {
-    Recompressed {
-        id: ObjectId,
-        new_w: u32,
-        new_h: u32,
-        encoded: EncodedPdfStream,
-        keep_smask: bool,
-        keep_mask: bool,
-        prepared_smask: Option<(ObjectId, u32, u32, EncodedPdfStream)>,
-    },
+    Recompressed(Box<RecompressedImageData>),
     KeptOriginal,
     SkippedUnsupported(String),
 }
@@ -1995,13 +2256,35 @@ fn is_single_dct_filter(doc: &Document, stream: &Stream) -> bool {
 }
 
 fn sync_all_stream_lengths(doc: &mut Document) {
-    for obj in doc.objects.values_mut() {
+    doc.objects.values_mut().for_each(|obj| {
         if let Object::Stream(stream) = obj {
             stream
                 .dict
                 .set("Length", Object::Integer(stream.content.len() as i64));
         }
-    }
+    });
+}
+
+/// Compresses embedded images inside a PDF file on disk while leaving page boxes
+/// (`/MediaBox`, `/CropBox`) and content streams (`cm` transformation matrices) untouched.
+pub fn compress_pdf_path<F>(
+    path: &Path,
+    options: &CompressionOptions,
+    mut on_progress: F,
+) -> Result<(Vec<u8>, CompressionStats), PdfError>
+where
+    F: FnMut(ProgressUpdate) + Send,
+{
+    compress_pdf_path_inner(path, options, &mut on_progress)
+}
+
+fn compress_pdf_path_inner(
+    path: &Path,
+    options: &CompressionOptions,
+    on_progress: &mut (dyn FnMut(ProgressUpdate) + Send),
+) -> Result<(Vec<u8>, CompressionStats), PdfError> {
+    let (doc, file_bytes) = load_unencrypted_document_from_path(path)?;
+    compress_document_with_mode(doc, file_bytes, options, on_progress, true)
 }
 
 /// Compresses embedded images inside a PDF while leaving page boxes (`/MediaBox`, `/CropBox`)
@@ -2014,25 +2297,156 @@ pub fn compress_pdf<F>(
 where
     F: FnMut(ProgressUpdate) + Send,
 {
-    let mut doc = load_unencrypted_document(input_bytes)?;
+    compress_pdf_inner(input_bytes, options, &mut on_progress)
+}
 
-    // Priority 1 (pre-image): strip orphaned incremental objects and deduplicate identical
-    // objects/streams before decoding images so duplicate images are processed only once.
-    let mut pre_opt = optimize_structure_gc_and_dedup(&mut doc, true);
-    let candidate_ids = collect_candidate_image_ids(&doc);
+fn compress_pdf_inner(
+    input_bytes: &[u8],
+    options: &CompressionOptions,
+    on_progress: &mut (dyn FnMut(ProgressUpdate) + Send),
+) -> Result<(Vec<u8>, CompressionStats), PdfError> {
+    let doc = load_unencrypted_document(input_bytes)?;
+    compress_document_with_mode(doc, input_bytes.len(), options, on_progress, true)
+}
 
-    let total_candidates = candidate_ids.len();
-    let mut stats = CompressionStats {
-        original_bytes: input_bytes.len(),
-        total_image_objects: total_candidates,
-        objects_pruned_gc: pre_opt.gc_removed,
-        #[cfg(test)]
-        objects_deduplicated: pre_opt.dedup_merged,
-        ..Default::default()
+#[allow(clippy::too_many_arguments)]
+fn process_single_image_job_with_mode(
+    doc: &Document,
+    job: &ImageCompressionJob,
+    scale: f32,
+    filter_type: FilterType,
+    format: ImageFormatChoice,
+    color_depth: ColorDepth,
+    quality: u8,
+    preview_fast: bool,
+    scratch: &mut ImageEncodeScratch,
+) -> Result<ImageCompressionOutcome, PdfError> {
+    let effective_depth = color_depth.fallback_for(format);
+    let outcome = match extract_image_from_doc(doc, job.id, job.orig_w, job.orig_h, job.target_hint)
+    {
+        Ok(extracted) => {
+            let prepared_smask = if let Some(smask_id) = extracted.smask_id {
+                prepare_scaled_smask_with_mode(
+                    doc,
+                    smask_id,
+                    scale,
+                    filter_type,
+                    preview_fast,
+                    scratch,
+                )?
+            } else {
+                None
+            };
+
+            let resized = if extracted.image.width() == job.new_w
+                && extracted.image.height() == job.new_h
+            {
+                extracted.image
+            } else {
+                let r = extracted.image.resize_exact(job.new_w, job.new_h, filter_type);
+                drop(extracted.image);
+                r
+            };
+
+            let converted = apply_color_depth_to_image(resized, effective_depth);
+            let encoded = encode_for_pdf_with_mode(
+                &converted,
+                job.new_w,
+                job.new_h,
+                format,
+                effective_depth,
+                quality,
+                preview_fast,
+                scratch,
+            )?;
+            drop(converted);
+
+            if effective_depth == ColorDepth::TrueColor24
+                && encoded.bytes.len() >= extracted.orig_raw_len
+            {
+                ImageCompressionOutcome::KeptOriginal
+            } else {
+                ImageCompressionOutcome::Recompressed(Box::new(RecompressedImageData {
+                    id: job.id,
+                    new_w: job.new_w,
+                    new_h: job.new_h,
+                    encoded,
+                    keep_smask: extracted.smask_id.is_some(),
+                    keep_mask: extracted.stencil_mask_id.is_some(),
+                    prepared_smask,
+                }))
+            }
+        }
+        Err(SkipReason::Unsupported(reason)) => ImageCompressionOutcome::SkippedUnsupported(reason),
     };
-    #[cfg(not(test))]
-    let _ = pre_opt.dedup_merged;
+    Ok(outcome)
+}
 
+fn apply_image_compression_outcome(
+    doc: &mut Document,
+    outcome: ImageCompressionOutcome,
+    stats: &mut CompressionStats,
+    processed_smasks: &mut HashSet<ObjectId>,
+) {
+    match outcome {
+        ImageCompressionOutcome::KeptOriginal => {
+            stats.images_kept_original += 1;
+        }
+        ImageCompressionOutcome::SkippedUnsupported(reason) => {
+            stats.images_skipped_unsupported += 1;
+            push_unique_reason(&mut stats.skipped_reasons, reason);
+        }
+        ImageCompressionOutcome::Recompressed(data) => {
+            let RecompressedImageData {
+                id,
+                new_w,
+                new_h,
+                encoded,
+                keep_smask,
+                keep_mask,
+                prepared_smask,
+            } = *data;
+            if let Some(smask) = prepared_smask {
+                let PreparedSmask {
+                    id: smask_id,
+                    width: sw,
+                    height: sh,
+                    encoded: smask_encoded,
+                } = *smask;
+                if processed_smasks.insert(smask_id) {
+                    if let Some(Object::Stream(s_stream)) = doc.objects.get_mut(&smask_id) {
+                        apply_encoded_image_to_stream(
+                            s_stream,
+                            sw,
+                            sh,
+                            smask_encoded,
+                            false,
+                            false,
+                        );
+                    }
+                }
+            }
+            if let Some(Object::Stream(stream)) = doc.objects.get_mut(&id) {
+                apply_encoded_image_to_stream(
+                    stream,
+                    new_w,
+                    new_h,
+                    encoded,
+                    keep_smask,
+                    keep_mask,
+                );
+                stats.images_recompressed += 1;
+            }
+        }
+    }
+}
+
+fn prepare_image_jobs(
+    doc: &Document,
+    candidate_ids: &[ObjectId],
+    options: &CompressionOptions,
+    stats: &mut CompressionStats,
+) -> (f32, u8, FilterType, Vec<ImageCompressionJob>) {
     let scale = if options.scale.is_finite() {
         options.scale.clamp(0.10, 1.00)
     } else {
@@ -2041,18 +2455,20 @@ where
     let scaling_requested = (scale - 1.0).abs() >= 1e-4;
     let quality = options.quality.clamp(1, 100);
     let filter_type = options.resize_filter.to_image_filter();
-    let passthrough_dct =
-        options.format == ImageFormatChoice::Jpeg && !scaling_requested && quality == 100;
+    let effective_depth = options.color_depth.fallback_for(options.format);
+    let passthrough_dct = options.format == ImageFormatChoice::Jpeg
+        && effective_depth == ColorDepth::TrueColor24
+        && !scaling_requested
+        && quality == 100;
 
-    // Phase 1 (sequential, fast): filter candidates and perform Q100/1.00x /DCTDecode passthrough.
-    let mut jobs = Vec::with_capacity(total_candidates);
-    for id in candidate_ids {
+    let mut jobs = Vec::with_capacity(candidate_ids.len());
+    for &id in candidate_ids {
         let (is_1bit, dims, has_bad_chroma_mask, is_single_dct) = match doc.objects.get(&id) {
             Some(Object::Stream(stream)) => (
-                is_bilevel_1bit_stream(&doc, stream),
-                read_image_dimensions(&doc, stream),
-                has_unsupported_chroma_mask(&doc, stream),
-                passthrough_dct && is_single_dct_filter(&doc, stream),
+                is_bilevel_1bit_stream(doc, stream),
+                read_image_dimensions(doc, stream),
+                has_unsupported_chroma_mask(doc, stream),
+                passthrough_dct && is_single_dct_filter(doc, stream),
             ),
             _ => continue,
         };
@@ -2117,7 +2533,40 @@ where
         });
     }
 
-    // Phase 2 (parallel across CPU cores): decode, resize, and re-encode independent XObjects.
+    (scale, quality, filter_type, jobs)
+}
+
+fn compress_document_with_mode(
+    mut doc: Document,
+    original_bytes: usize,
+    options: &CompressionOptions,
+    on_progress: &mut (dyn FnMut(ProgressUpdate) + Send),
+    parallel: bool,
+) -> Result<(Vec<u8>, CompressionStats), PdfError> {
+    // Priority 1 (pre-image): strip orphaned incremental objects and deduplicate identical
+    // objects/streams before decoding images so duplicate images are processed only once.
+    let pre_opt = optimize_structure_gc_and_dedup_with_mode(&mut doc, parallel);
+    let candidate_ids = collect_candidate_image_ids(&doc);
+
+    let total_candidates = candidate_ids.len();
+    let mut stats = CompressionStats {
+        original_bytes,
+        total_image_objects: total_candidates,
+        objects_pruned_gc: pre_opt.gc_removed,
+        #[cfg(test)]
+        objects_deduplicated: pre_opt.dedup_merged,
+        ..Default::default()
+    };
+    #[cfg(not(test))]
+    let _ = pre_opt.dedup_merged;
+
+    // Phase 1 (sequential, fast): filter candidates and perform Q100/1.00x /DCTDecode passthrough.
+    let (scale, quality, filter_type, jobs) =
+        prepare_image_jobs(&doc, &candidate_ids, options, &mut stats);
+
+    // Phase 2 (bounded chunked parallelism): decode -> resize -> encode small chunks via the
+    // dedicated below-normal thread pool and apply results in place before the next chunk,
+    // preventing decoded pixel buffers from accumulating in RAM.
     let pre_handled = stats.images_skipped_small_or_mask
         + stats.images_skipped_unsupported
         + stats.images_kept_original;
@@ -2134,117 +2583,60 @@ where
         });
     }
 
-    let processed_count = AtomicUsize::new(0);
-    let progress_lock = Mutex::new(&mut on_progress);
-
-    let outcomes: Vec<Result<ImageCompressionOutcome, PdfError>> = {
-        let doc_ref = &doc;
-        jobs.par_iter()
-            .map(|job| {
-                let outcome = match extract_image_from_doc(
-                    doc_ref,
-                    job.id,
-                    job.orig_w,
-                    job.orig_h,
-                    job.target_hint,
-                ) {
-                    Ok(extracted) => {
-                        let prepared_smask = if let Some(smask_id) = extracted.smask_id {
-                            prepare_scaled_smask(doc_ref, smask_id, scale, filter_type)?
-                        } else {
-                            None
-                        };
-
-                        let resized = if extracted.image.width() == job.new_w
-                            && extracted.image.height() == job.new_h
-                        {
-                            extracted.image
-                        } else {
-                            extracted.image.resize_exact(job.new_w, job.new_h, filter_type)
-                        };
-
-                        let encoded =
-                            encode_for_pdf(&resized, job.new_w, job.new_h, options.format, quality)?;
-
-                        if encoded.bytes.len() >= extracted.orig_raw_len {
-                            ImageCompressionOutcome::KeptOriginal
-                        } else {
-                            ImageCompressionOutcome::Recompressed {
-                                id: job.id,
-                                new_w: job.new_w,
-                                new_h: job.new_h,
-                                encoded,
-                                keep_smask: extracted.smask_id.is_some(),
-                                keep_mask: extracted.stencil_mask_id.is_some(),
-                                prepared_smask,
-                            }
-                        }
-                    }
-                    Err(SkipReason::Unsupported(reason)) => {
-                        ImageCompressionOutcome::SkippedUnsupported(reason)
-                    }
-                };
-
-                let done = pre_handled + processed_count.fetch_add(1, Ordering::Relaxed) + 1;
-                if let Ok(mut cb) = progress_lock.try_lock() {
-                    cb(ProgressUpdate {
-                        current: done.min(total_progress),
-                        total: total_progress,
-                    });
-                }
-
-                Ok(outcome)
-            })
-            .collect()
-    };
-
-    // Phase 3 (sequential deterministic apply): mutate lopdf objects in document order.
     let mut processed_smasks: HashSet<ObjectId> = HashSet::new();
-    for res in outcomes {
-        match res? {
-            ImageCompressionOutcome::KeptOriginal => {
-                stats.images_kept_original += 1;
-            }
-            ImageCompressionOutcome::SkippedUnsupported(reason) => {
-                stats.images_skipped_unsupported += 1;
-                push_unique_reason(&mut stats.skipped_reasons, reason);
-            }
-            ImageCompressionOutcome::Recompressed {
-                id,
-                new_w,
-                new_h,
-                encoded,
-                keep_smask,
-                keep_mask,
-                prepared_smask,
-            } => {
-                if let Some((smask_id, sw, sh, smask_encoded)) = prepared_smask {
-                    if processed_smasks.insert(smask_id) {
-                        pre_opt.cached_flate_decoded.remove(&smask_id);
-                        if let Some(Object::Stream(s_stream)) = doc.objects.get_mut(&smask_id) {
-                            apply_encoded_image_to_stream(
-                                s_stream,
-                                sw,
-                                sh,
-                                smask_encoded,
-                                false,
-                                false,
-                            );
+
+    if !parallel {
+        let mut scratch = ImageEncodeScratch::default();
+        for job in &jobs {
+            let outcome = process_single_image_job_with_mode(
+                &doc,
+                job,
+                scale,
+                filter_type,
+                options.format,
+                options.color_depth,
+                quality,
+                false,
+                &mut scratch,
+            )?;
+            apply_image_compression_outcome(&mut doc, outcome, &mut stats, &mut processed_smasks);
+        }
+    } else {
+        let processed_count = AtomicUsize::new(0);
+        let progress_lock = Mutex::new(&mut *on_progress);
+        let chunk_size = worker_thread_count().max(1);
+
+        for job_chunk in jobs.chunks(chunk_size) {
+            let outcomes: Vec<Result<ImageCompressionOutcome, PdfError>> = worker_pool().install(|| {
+                let doc_ref = &doc;
+                job_chunk
+                    .par_iter()
+                    .map_init(ImageEncodeScratch::default, |scratch, job| {
+                        let res = process_single_image_job_with_mode(
+                            doc_ref,
+                            job,
+                            scale,
+                            filter_type,
+                            options.format,
+                            options.color_depth,
+                            quality,
+                            false,
+                            scratch,
+                        );
+                        let done = pre_handled + processed_count.fetch_add(1, Ordering::Relaxed) + 1;
+                        if let Ok(mut cb) = progress_lock.try_lock() {
+                            cb(ProgressUpdate {
+                                current: done.min(total_progress),
+                                total: total_progress,
+                            });
                         }
-                    }
-                }
-                pre_opt.cached_flate_decoded.remove(&id);
-                if let Some(Object::Stream(stream)) = doc.objects.get_mut(&id) {
-                    apply_encoded_image_to_stream(
-                        stream,
-                        new_w,
-                        new_h,
-                        encoded,
-                        keep_smask,
-                        keep_mask,
-                    );
-                    stats.images_recompressed += 1;
-                }
+                        res
+                    })
+                    .collect()
+            });
+
+            for res in outcomes {
+                apply_image_compression_outcome(&mut doc, res?, &mut stats, &mut processed_smasks);
             }
         }
     }
@@ -2256,8 +2648,7 @@ where
 
     // Priority 3: high-ratio lossless Flate re-compression of content streams, fonts, CMaps,
     // ICC profiles, and any uncompressed non-metadata streams (guarded strictly so nothing bloats).
-    stats.flate_streams_recompressed =
-        recompress_flate_and_raw_streams(&mut doc, pre_opt.cached_flate_decoded);
+    stats.flate_streams_recompressed = recompress_flate_and_raw_streams(&mut doc, parallel);
 
     // Post-compression GC pass to prune any newly orphaned auxiliary streams.
     let post_gc = garbage_collect_unreachable_objects(&mut doc);
@@ -2268,6 +2659,7 @@ where
     normalize_generations_to_zero(&mut doc);
     doc.renumber_objects();
     sync_all_stream_lengths(&mut doc);
+    stats.payload_stream_bytes = subset_payload_stream_bytes(&doc);
 
     let save_options = SaveOptions::builder()
         .use_object_streams(true)
@@ -2276,13 +2668,100 @@ where
         .max_objects_per_stream(200)
         .build();
 
-    let mut out_bytes = Vec::with_capacity(input_bytes.len());
+    let mut out_bytes = Vec::with_capacity(original_bytes.min(32 * 1024 * 1024));
     doc.save_with_options(&mut out_bytes, save_options)
         .map_err(|e| PdfError::Save(e.to_string()))?;
+    drop(doc);
     compress_trailing_xref_stream(&mut out_bytes);
 
     stats.compressed_bytes = out_bytes.len();
     Ok((out_bytes, stats))
+}
+
+/// Fast single-page subset compressor for interactive live preview: skips full-document
+/// GC/dedup, Flate level-9 recompression, and ObjStm serialization, uses single-pass
+/// fast preview JPEG/Flate encoding, and checks cancellation between images.
+fn compress_subset_for_preview(
+    mut doc: Document,
+    original_bytes: usize,
+    options: &CompressionOptions,
+    is_cancelled: &dyn Fn() -> bool,
+) -> Result<(Vec<u8>, CompressionStats), PdfError> {
+    if is_cancelled() {
+        return Err(PdfError::Parse("Preview cancelled".to_string()));
+    }
+
+    let candidate_ids = collect_candidate_image_ids(&doc);
+    let mut stats = CompressionStats {
+        original_bytes,
+        total_image_objects: candidate_ids.len(),
+        ..Default::default()
+    };
+
+    let (scale, quality, filter_type, jobs) =
+        prepare_image_jobs(&doc, &candidate_ids, options, &mut stats);
+
+    let mut processed_smasks: HashSet<ObjectId> = HashSet::new();
+    let mut scratch = ImageEncodeScratch::default();
+    for job in &jobs {
+        if is_cancelled() {
+            return Err(pdf_parse_err("Preview cancelled".to_string()));
+        }
+        let outcome = process_single_image_job_with_mode(
+            &doc,
+            job,
+            scale,
+            filter_type,
+            options.format,
+            options.color_depth,
+            quality,
+            true,
+            &mut scratch,
+        )?;
+        apply_image_compression_outcome(&mut doc, outcome, &mut stats, &mut processed_smasks);
+    }
+
+    if is_cancelled() {
+        return Err(PdfError::Parse("Preview cancelled".to_string()));
+    }
+
+    stats.payload_stream_bytes = subset_payload_stream_bytes(&doc);
+    if stats.images_recompressed == 0 && stats.flate_streams_recompressed == 0 {
+        stats.compressed_bytes = original_bytes;
+        return Ok((Vec::new(), stats));
+    }
+
+    sync_all_stream_lengths(&mut doc);
+    let save_options = SaveOptions::builder()
+        .use_object_streams(false)
+        .use_xref_streams(false)
+        .build();
+    let mut out_bytes = Vec::with_capacity(original_bytes.clamp(4096, 16 * 1024 * 1024));
+    doc.save_with_options(&mut out_bytes, save_options)
+        .map_err(|e| PdfError::Save(e.to_string()))?;
+    stats.compressed_bytes = out_bytes.len();
+    Ok((out_bytes, stats))
+}
+
+fn load_unencrypted_document_from_path(path: &Path) -> Result<(Document, usize), PdfError> {
+    let meta = std::fs::metadata(path)?;
+    let file_bytes = usize::try_from(meta.len()).unwrap_or(usize::MAX);
+    if file_bytes == 0 {
+        return Err(PdfError::Parse("The PDF file is empty (0 bytes).".to_string()));
+    }
+    let doc = Document::load(path).map_err(|e| {
+        let msg = e.to_string();
+        let lower = msg.to_ascii_lowercase();
+        if lower.contains("encrypt") || lower.contains("decrypt") || lower.contains("password") {
+            PdfError::Encrypted
+        } else {
+            PdfError::Parse(msg)
+        }
+    })?;
+    if doc.is_encrypted() || doc.trailer.get(b"Encrypt").is_ok() {
+        return Err(PdfError::Encrypted);
+    }
+    Ok((doc, file_bytes))
 }
 
 fn load_unencrypted_document(input_bytes: &[u8]) -> Result<Document, PdfError> {
@@ -2395,27 +2874,27 @@ fn collect_subsidiary_mask_ids(doc: &Document) -> HashSet<ObjectId> {
 fn extract_filters<'a>(
     doc: &'a Document,
     dict: &'a Dictionary,
-) -> Result<Vec<&'a [u8]>, SkipReason> {
+) -> Result<FilterChain<'a>, SkipReason> {
     let Some(filter_obj) = dict_get_resolved(doc, dict, b"Filter") else {
-        return Ok(Vec::new());
+        return Ok(SmallVec::new());
     };
     match filter_obj {
-        Object::Name(name) => Ok(vec![name.as_slice()]),
+        Object::Name(name) => Ok(smallvec![name.as_slice()]),
         Object::Array(arr) => {
-            let mut out = Vec::with_capacity(arr.len());
+            let mut out = FilterChain::with_capacity(arr.len());
             for item in arr {
                 let resolved = resolve_obj(doc, item).ok_or_else(|| {
-                    SkipReason::Unsupported("Unresolvable /Filter entry in image stream.".into())
+                    skip_unsupported_str("Unresolvable /Filter entry in image stream.")
                 })?;
                 let name = obj_as_name(resolved).ok_or_else(|| {
-                    SkipReason::Unsupported("Invalid non-name /Filter entry in image stream.".into())
+                    skip_unsupported_str("Invalid non-name /Filter entry in image stream.")
                 })?;
                 out.push(name);
             }
             Ok(out)
         }
-        _ => Err(SkipReason::Unsupported(
-            "Invalid /Filter object type in image stream.".into(),
+        _ => Err(skip_unsupported_str(
+            "Invalid /Filter object type in image stream.",
         )),
     }
 }
@@ -2444,21 +2923,22 @@ fn dict_entry_needs_clone_resolution(dict: &Dictionary, key: &[u8]) -> bool {
     }
 }
 
-fn decompress_stream_with_resolved_dict(
-    doc: &Document,
-    stream: &Stream,
+fn decompress_stream_with_resolved_dict<'a>(
+    doc: &'a Document,
+    stream: &'a Stream,
     strip_last_filter: bool,
-) -> Result<Vec<u8>, SkipReason> {
+) -> Result<Cow<'a, [u8]>, SkipReason> {
     if !strip_last_filter {
         if stream.dict.get(b"Filter").is_err() {
-            return Ok(stream.content.clone());
+            return Ok(Cow::Borrowed(stream.content.as_slice()));
         }
         if !dict_entry_needs_clone_resolution(&stream.dict, b"Filter")
             && !dict_entry_needs_clone_resolution(&stream.dict, b"DecodeParms")
         {
             return stream
                 .decompressed_content_with_limit(MAX_DECOMPRESSED_BYTES)
-                .map_err(|e| SkipReason::Unsupported(format!("Stream decompression skipped: {e}")));
+                .map(Cow::Owned)
+                .map_err(|e| skip_unsupported(format!("Stream decompression skipped: {e}")));
         }
     }
 
@@ -2513,22 +2993,20 @@ fn decompress_stream_with_resolved_dict(
     }
 
     if cloned.dict.get(b"Filter").is_err() {
-        return Ok(cloned.content);
+        return Ok(Cow::Owned(cloned.content));
     }
 
     cloned
         .decompressed_content_with_limit(MAX_DECOMPRESSED_BYTES)
-        .map_err(|e| SkipReason::Unsupported(format!("Stream decompression skipped: {e}")))
+        .map(Cow::Owned)
+        .map_err(|e| skip_unsupported(format!("Stream decompression skipped: {e}")))
 }
 
 fn has_unsupported_chroma_mask(doc: &Document, stream: &Stream) -> bool {
     let Ok(mask_obj) = stream.dict.get(b"Mask") else {
         return false;
     };
-    match resolve_obj(doc, mask_obj) {
-        Some(Object::Stream(_)) => false,
-        _ => true,
-    }
+    !matches!(resolve_obj(doc, mask_obj), Some(Object::Stream(_)))
 }
 
 fn validate_image_filters(filters: &[&[u8]]) -> Result<FinalImageCodec, SkipReason> {
@@ -2569,12 +3047,12 @@ fn extract_codec_payload<'a>(
         if filters.is_empty() {
             Ok(Cow::Borrowed(&stream.content))
         } else {
-            decompress_stream_with_resolved_dict(doc, stream, false).map(Cow::Owned)
+            decompress_stream_with_resolved_dict(doc, stream, false)
         }
     } else if filters.len() == 1 {
         Ok(Cow::Borrowed(&stream.content))
     } else {
-        decompress_stream_with_resolved_dict(doc, stream, true).map(Cow::Owned)
+        decompress_stream_with_resolved_dict(doc, stream, true)
     }
 }
 
@@ -2674,7 +3152,7 @@ fn extract_image_from_doc(
         decode_stream_to_image(doc, stream, orig_w, orig_h, false, false, target_resolution)?;
 
     let smask_id = match stream.dict.get(b"SMask") {
-        Ok(Object::Reference(ref_id)) if doc.objects.get(ref_id).is_some() => Some(*ref_id),
+        Ok(Object::Reference(ref_id)) if doc.objects.contains_key(ref_id) => Some(*ref_id),
         Ok(_) => {
             return Err(SkipReason::Unsupported(
                 "Skipped an image with a non-indirect /SMask reference.".into(),
@@ -2717,12 +3195,14 @@ fn extract_image_from_doc(
 /// Scales an 8-bit grayscale `/SMask` stream when downscaling (`scale < 1.0`) or uncompressed,
 /// preserving `/ColorSpace /DeviceGray`, `/BitsPerComponent 8`, and `/Filter /FlateDecode`.
 /// Leaves 1-bit `/SMask` streams completely untouched and guards compressed `/SMask`s against bloat.
-fn prepare_scaled_smask(
+fn prepare_scaled_smask_with_mode(
     doc: &Document,
     smask_id: ObjectId,
     scale: f32,
     filter_type: FilterType,
-) -> Result<Option<(ObjectId, u32, u32, EncodedPdfStream)>, PdfError> {
+    preview_fast: bool,
+    scratch: &mut ImageEncodeScratch,
+) -> Result<Option<Box<PreparedSmask>>, PdfError> {
     let Some(Object::Stream(smask_stream)) = doc.objects.get(&smask_id) else {
         return Ok(None);
     };
@@ -2737,8 +3217,8 @@ fn prepare_scaled_smask(
     let filters = extract_filters(doc, &smask_stream.dict).unwrap_or_default();
     let s_is_compressed = !filters.is_empty();
     let scaling_requested = (scale - 1.0).abs() >= 1e-4;
-    if !scaling_requested && s_is_compressed {
-        // Keep already-compressed 8-bit /SMask streams untouched at 1.0x.
+    if (!scaling_requested && s_is_compressed) || (preview_fast && !scaling_requested) {
+        // Keep already-compressed 8-bit /SMask streams untouched at 1.0x (and all unscaled /SMasks in fast preview).
         return Ok(None);
     }
 
@@ -2753,7 +3233,7 @@ fn prepare_scaled_smask(
     let alpha_img =
         decode_stream_to_image(doc, smask_stream, sw, sh, true, false, target_hint).map_err(|e| {
             match e {
-                SkipReason::Unsupported(msg) => PdfError::ImageEncode(msg),
+                SkipReason::Unsupported(msg) => pdf_encode_err(msg),
             }
         })?;
     let resized = if alpha_img.width() == nw && alpha_img.height() == nh {
@@ -2763,11 +3243,16 @@ fn prepare_scaled_smask(
     };
 
     let luma = DynamicImage::ImageLuma8(resized.into_luma8());
-    let encoded = encode_pdf_flate_lossless(&luma, nw, nh)?;
+    let encoded = encode_pdf_flate_lossless_with_mode(&luma, nw, nh, preview_fast, scratch)?;
     if s_is_compressed && encoded.bytes.len() >= orig_len {
         return Ok(None);
     }
-    Ok(Some((smask_id, nw, nh, encoded)))
+    Ok(Some(Box::new(PreparedSmask {
+        id: smask_id,
+        width: nw,
+        height: nh,
+        encoded,
+    })))
 }
 
 fn decode_dct_image(
@@ -2873,15 +3358,7 @@ fn decode_jbig2_to_1bit_packed(
     let globals_bytes: Option<Cow<'_, [u8]>> = extract_codec_decode_parms(doc, &stream.dict)
         .and_then(|parms| dict_get_resolved(doc, parms, b"JBIG2Globals"))
         .and_then(|obj| match obj {
-            Object::Stream(s) => {
-                if s.dict.get(b"Filter").is_ok() {
-                    decompress_stream_with_resolved_dict(doc, s, false)
-                        .ok()
-                        .map(Cow::Owned)
-                } else {
-                    Some(Cow::Borrowed(s.content.as_slice()))
-                }
-            }
+            Object::Stream(s) => decompress_stream_with_resolved_dict(doc, s, false).ok(),
             _ => None,
         });
 
@@ -2914,9 +3391,9 @@ fn decode_jbig2_to_1bit_packed(
 
         fn push_pixel_chunk(&mut self, black: bool, chunk_count: u32) {
             let count = (chunk_count as usize) * 8;
-            if self.row < self.out_h {
-                if !black {
-                    if self.col % 8 == 0 && self.col + count <= self.out_w {
+            if self.row < self.out_h
+                && !black {
+                    if self.col.is_multiple_of(8) && self.col + count <= self.out_w {
                         let start = self.row * self.row_bytes + (self.col >> 3);
                         let bytes = chunk_count as usize;
                         self.out[start..start + bytes].fill(0xFF);
@@ -2928,7 +3405,6 @@ fn decode_jbig2_to_1bit_packed(
                         }
                     }
                 }
-            }
             self.col += count;
         }
 
@@ -3124,12 +3600,12 @@ fn read_bits_per_component_with_default(doc: &Document, stream: &Stream, default
         .unwrap_or(default)
 }
 
-fn read_decode_array(doc: &Document, stream: &Stream) -> Option<Vec<f64>> {
+fn read_decode_array(doc: &Document, stream: &Stream) -> Option<DecodeArray> {
     let arr = match dict_get_resolved(doc, &stream.dict, b"Decode")? {
         Object::Array(a) => a,
         _ => return None,
     };
-    let mut values = Vec::with_capacity(arr.len());
+    let mut values = DecodeArray::with_capacity(arr.len());
     for item in arr {
         let resolved = resolve_obj(doc, item)?;
         values.push(obj_as_f64(resolved)?);
@@ -3231,17 +3707,9 @@ fn resolve_color_space_spec<'a>(
                 })?;
                 let lookup: Cow<'a, [u8]> = match lookup_obj {
                     Object::String(bytes, _) => Cow::Borrowed(bytes.as_slice()),
-                    Object::Stream(s) => {
-                        if s.dict.get(b"Filter").is_ok() {
-                            Cow::Owned(decompress_stream_with_resolved_dict(doc, s, false)?)
-                        } else {
-                            Cow::Borrowed(s.content.as_slice())
-                        }
-                    }
+                    Object::Stream(s) => decompress_stream_with_resolved_dict(doc, s, false)?,
                     _ => {
-                        return Err(SkipReason::Unsupported(
-                            "Invalid /Indexed lookup object.".into(),
-                        ))
+                        return Err(skip_unsupported_str("Invalid /Indexed lookup object."));
                     }
                 };
                 return Ok(ColorSpaceSpec::Indexed {
@@ -3330,15 +3798,21 @@ fn decode_uncompressed_to_image(
                     Ok(DynamicImage::ImageRgb8(img))
                 }
                 BaseColorSpace::Cmyk => {
-                    let mut rgb_out = Vec::with_capacity((width as usize) * (height as usize) * 3);
-                    for chunk in samples.chunks_exact(4) {
-                        let (r, g, b) = cmyk_bytes_to_rgb(chunk[0], chunk[1], chunk[2], chunk[3]);
-                        rgb_out.push(r);
-                        rgb_out.push(g);
-                        rgb_out.push(b);
-                    }
+                    let pixel_count = (width as usize) * (height as usize);
+                    let src = &samples[..pixel_count * 4];
+                    let mut rgb_out = vec![0u8; pixel_count * 3];
+                    src.as_chunks::<4>()
+                        .0
+                        .iter()
+                        .zip(rgb_out.as_chunks_mut::<3>().0.iter_mut())
+                        .for_each(|(chunk, dst)| {
+                            let (r, g, b) = cmyk_bytes_to_rgb(chunk[0], chunk[1], chunk[2], chunk[3]);
+                            dst[0] = r;
+                            dst[1] = g;
+                            dst[2] = b;
+                        });
                     let img = RgbImage::from_raw(width, height, rgb_out).ok_or_else(|| {
-                        SkipReason::Unsupported("Failed to convert CMYK pixel buffer.".into())
+                        skip_unsupported_str("Failed to convert CMYK pixel buffer.")
                     })?;
                     Ok(DynamicImage::ImageRgb8(img))
                 }
@@ -3358,61 +3832,83 @@ fn expand_indexed_samples(
     let base_comps = base.components();
     let needed_table_len = (hival + 1) * base_comps;
     if lookup.len() < needed_table_len {
-        return Err(SkipReason::Unsupported(
-            "Skipped /Indexed image with truncated palette table.".into(),
+        return Err(skip_unsupported_str(
+            "Skipped /Indexed image with truncated palette table.",
         ));
     }
     let pixel_count = (width as usize) * (height as usize);
     if indices.len() < pixel_count {
-        return Err(SkipReason::Unsupported(
-            "Skipped /Indexed image with truncated index samples.".into(),
+        return Err(skip_unsupported_str(
+            "Skipped /Indexed image with truncated index samples.",
         ));
     }
+    let idx_slice = &indices[..pixel_count];
+    let lookup_slice = &lookup[..needed_table_len];
     match base {
         BaseColorSpace::Gray => {
-            let mut out = Vec::with_capacity(pixel_count);
-            for &idx_val in &indices[..pixel_count] {
+            let mut out = vec![0u8; pixel_count];
+            idx_slice.iter().zip(out.iter_mut()).for_each(|(&idx_val, dst)| {
                 let idx = (idx_val as usize).min(hival);
-                out.push(lookup[idx]);
-            }
+                *dst = lookup_slice[idx];
+            });
             let img = GrayImage::from_raw(width, height, out).ok_or_else(|| {
-                SkipReason::Unsupported("Failed to build indexed grayscale buffer.".into())
+                skip_unsupported_str("Failed to build indexed grayscale buffer.")
             })?;
             Ok(DynamicImage::ImageLuma8(img))
         }
         BaseColorSpace::Rgb => {
-            let mut out = Vec::with_capacity(pixel_count * 3);
-            for &idx_val in &indices[..pixel_count] {
-                let idx = (idx_val as usize).min(hival) * 3;
-                out.extend_from_slice(&lookup[idx..idx + 3]);
-            }
+            let mut palette = [[0u8; 3]; 256];
+            let entries = (hival + 1).min(256);
+            lookup_slice
+                .as_chunks::<3>()
+                .0
+                .iter()
+                .take(entries)
+                .zip(palette.iter_mut())
+                .for_each(|(src, dst)| {
+                    *dst = *src;
+                });
+            let mut out = vec![0u8; pixel_count * 3];
+            idx_slice
+                .iter()
+                .zip(out.as_chunks_mut::<3>().0.iter_mut())
+                .for_each(|(&idx_val, dst)| {
+                    *dst = palette[(idx_val as usize).min(hival).min(255)];
+                });
             let img = RgbImage::from_raw(width, height, out).ok_or_else(|| {
-                SkipReason::Unsupported("Failed to build indexed RGB buffer.".into())
+                skip_unsupported_str("Failed to build indexed RGB buffer.")
             })?;
             Ok(DynamicImage::ImageRgb8(img))
         }
         BaseColorSpace::Cmyk => {
-            let mut out = Vec::with_capacity(pixel_count * 3);
-            for &idx_val in &indices[..pixel_count] {
-                let idx = (idx_val as usize).min(hival) * 4;
-                let (r, g, b) = cmyk_bytes_to_rgb(
-                    lookup[idx],
-                    lookup[idx + 1],
-                    lookup[idx + 2],
-                    lookup[idx + 3],
-                );
-                out.push(r);
-                out.push(g);
-                out.push(b);
-            }
+            let mut palette = [[0u8; 3]; 256];
+            let entries = (hival + 1).min(256);
+            lookup_slice
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .take(entries)
+                .zip(palette.iter_mut())
+                .for_each(|(src, dst)| {
+                    let (r, g, b) = cmyk_bytes_to_rgb(src[0], src[1], src[2], src[3]);
+                    *dst = [r, g, b];
+                });
+            let mut out = vec![0u8; pixel_count * 3];
+            idx_slice
+                .iter()
+                .zip(out.as_chunks_mut::<3>().0.iter_mut())
+                .for_each(|(&idx_val, dst)| {
+                    *dst = palette[(idx_val as usize).min(hival).min(255)];
+                });
             let img = RgbImage::from_raw(width, height, out).ok_or_else(|| {
-                SkipReason::Unsupported("Failed to build indexed CMYK buffer.".into())
+                skip_unsupported_str("Failed to build indexed CMYK buffer.")
             })?;
             Ok(DynamicImage::ImageRgb8(img))
         }
     }
 }
 
+#[inline]
 fn cmyk_bytes_to_rgb(c: u8, m: u8, y: u8, k: u8) -> (u8, u8, u8) {
     let c = c as f32 / 255.0;
     let m = m as f32 / 255.0;
@@ -3425,7 +3921,7 @@ fn cmyk_bytes_to_rgb(c: u8, m: u8, y: u8, k: u8) -> (u8, u8, u8) {
 }
 
 fn apply_decode_array_u8(samples: &mut [u8], components: usize, decode: &[f64]) {
-    if decode.len() < components * 2 {
+    if components == 0 || decode.len() < components * 2 {
         return;
     }
     // Check if decode is already the identity [0, 1, 0, 1, ...].
@@ -3436,7 +3932,50 @@ fn apply_decode_array_u8(samples: &mut [u8], components: usize, decode: &[f64]) 
         return;
     }
 
-    for pixel in samples.chunks_exact_mut(components) {
+    if components <= 4 {
+        let mut luts = [[0u8; 256]; 4];
+        for (c, lut) in luts.iter_mut().take(components).enumerate() {
+            let d_min = decode[c * 2];
+            let d_span = decode[c * 2 + 1] - d_min;
+            for (v, out) in lut.iter_mut().enumerate() {
+                let mapped = d_min + ((v as f64) / 255.0) * d_span;
+                *out = (mapped * 255.0).round().clamp(0.0, 255.0) as u8;
+            }
+        }
+        match components {
+            1 => {
+                let lut0 = &luts[0];
+                samples.iter_mut().for_each(|b| *b = lut0[*b as usize]);
+            }
+            3 => {
+                let (lut0, lut1, lut2) = (&luts[0], &luts[1], &luts[2]);
+                samples.as_chunks_mut::<3>().0.iter_mut().for_each(|px| {
+                    px[0] = lut0[px[0] as usize];
+                    px[1] = lut1[px[1] as usize];
+                    px[2] = lut2[px[2] as usize];
+                });
+            }
+            4 => {
+                let (lut0, lut1, lut2, lut3) = (&luts[0], &luts[1], &luts[2], &luts[3]);
+                samples.as_chunks_mut::<4>().0.iter_mut().for_each(|px| {
+                    px[0] = lut0[px[0] as usize];
+                    px[1] = lut1[px[1] as usize];
+                    px[2] = lut2[px[2] as usize];
+                    px[3] = lut3[px[3] as usize];
+                });
+            }
+            _ => {
+                samples.chunks_exact_mut(components).for_each(|pixel| {
+                    pixel.iter_mut().zip(luts.iter()).for_each(|(b, lut)| {
+                        *b = lut[*b as usize];
+                    });
+                });
+            }
+        }
+        return;
+    }
+
+    samples.chunks_exact_mut(components).for_each(|pixel| {
         for (c, byte) in pixel.iter_mut().enumerate() {
             let d_min = decode[c * 2];
             let d_max = decode[c * 2 + 1];
@@ -3444,7 +3983,7 @@ fn apply_decode_array_u8(samples: &mut [u8], components: usize, decode: &[f64]) 
             let mapped = d_min + t * (d_max - d_min);
             *byte = (mapped * 255.0).round().clamp(0.0, 255.0) as u8;
         }
-    }
+    });
 }
 
 /// Unpacks raw PDF image samples (1, 2, 4, or 8 bpc) preserving exact integer values (used for /Indexed).
@@ -3479,20 +4018,22 @@ fn unpack_samples_per_row<'a>(
         return Ok(Cow::Borrowed(&raw[..total_samples]));
     }
 
-    let mut out = Vec::with_capacity(total_samples);
+    let mut out = vec![0u8; total_samples];
     let mask = ((1u16 << bpc) - 1) as u8;
     let samples_per_row = width * components;
+    let bpc_usize = bpc as usize;
 
-    for row in 0..height {
-        let row_slice = &raw[row * row_bytes..(row + 1) * row_bytes];
-        for i in 0..samples_per_row {
-            let bit_offset = i * (bpc as usize);
-            let byte_idx = bit_offset / 8;
-            let shift = 8 - (bpc as usize) - (bit_offset % 8);
-            let val = (row_slice[byte_idx] >> shift) & mask;
-            out.push(val);
-        }
-    }
+    raw[..expected_bytes]
+        .chunks_exact(row_bytes)
+        .zip(out.chunks_exact_mut(samples_per_row))
+        .for_each(|(row_slice, dst_row)| {
+            dst_row.iter_mut().enumerate().for_each(|(i, dst)| {
+                let bit_offset = i * bpc_usize;
+                let byte_idx = bit_offset >> 3;
+                let shift = 8 - bpc_usize - (bit_offset & 7);
+                *dst = (row_slice[byte_idx] >> shift) & mask;
+            });
+        });
     Ok(Cow::Owned(out))
 }
 
@@ -3507,45 +4048,93 @@ fn unpack_samples_to_u8<'a>(
     let total_samples = width
         .checked_mul(height)
         .and_then(|v| v.checked_mul(components))
-        .ok_or_else(|| SkipReason::Unsupported("Image sample count overflow.".into()))?;
+        .ok_or_else(|| skip_unsupported_str("Image sample count overflow."))?;
 
     if bpc == 16 {
         let expected = total_samples
             .checked_mul(2)
-            .ok_or_else(|| SkipReason::Unsupported("16-bit image buffer overflow.".into()))?;
+            .ok_or_else(|| skip_unsupported_str("16-bit image buffer overflow."))?;
         if raw.len() < expected {
-            return Err(SkipReason::Unsupported(
-                "Skipped 16-bit image stream with truncated pixel data.".into(),
+            return Err(skip_unsupported_str(
+                "Skipped 16-bit image stream with truncated pixel data.",
             ));
         }
-        let mut out = Vec::with_capacity(total_samples);
-        for pair in raw[..expected].chunks_exact(2) {
-            out.push(pair[0]);
-        }
+        let mut out = vec![0u8; total_samples];
+        raw[..expected]
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .zip(out.iter_mut())
+            .for_each(|(pair, dst)| *dst = pair[0]);
         return Ok(Cow::Owned(out));
     }
 
     let mut out = unpack_samples_per_row(raw, width, height, components, bpc)?;
     if bpc < 8 {
-        let max_val = ((1u16 << bpc) - 1) as u16;
-        for v in out.to_mut() {
+        let max_val = (1u16 << bpc) - 1;
+        out.to_mut().iter_mut().for_each(|v| {
             *v = ((*v as u16 * 255 + max_val / 2) / max_val) as u8;
-        }
+        });
     }
     Ok(out)
 }
 
-fn encode_for_pdf(
+fn apply_color_depth_to_image(image: DynamicImage, depth: ColorDepth) -> DynamicImage {
+    match depth {
+        ColorDepth::Bit1 => {
+            let mut luma = image.into_luma8();
+            luma.as_mut()
+                .iter_mut()
+                .for_each(|px| *px = if *px >= 128 { 255 } else { 0 });
+            DynamicImage::ImageLuma8(luma)
+        }
+        ColorDepth::Gray8 => DynamicImage::ImageLuma8(image.into_luma8()),
+        ColorDepth::HighColor16 => {
+            let mut rgb = image.into_rgb8();
+            rgb.as_mut()
+                .as_chunks_mut::<3>()
+                .0
+                .iter_mut()
+                .for_each(|px| {
+                let r5 = px[0] >> 3;
+                let g6 = px[1] >> 2;
+                let b5 = px[2] >> 3;
+                px[0] = (r5 << 3) | (r5 >> 2);
+                px[1] = (g6 << 2) | (g6 >> 4);
+                px[2] = (b5 << 3) | (b5 >> 2);
+            });
+            DynamicImage::ImageRgb8(rgb)
+        }
+        ColorDepth::TrueColor24 | ColorDepth::Hdr30 => image,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn encode_for_pdf_with_mode(
     image: &DynamicImage,
     width: u32,
     height: u32,
     format: ImageFormatChoice,
+    color_depth: ColorDepth,
     quality: u8,
+    preview_fast: bool,
+    scratch: &mut ImageEncodeScratch,
 ) -> Result<EncodedPdfStream, PdfError> {
+    let effective_depth = color_depth.fallback_for(format);
     match format {
-        ImageFormatChoice::Jpeg => encode_jpeg_stream(image, width, height, quality),
-        ImageFormatChoice::Jpeg2000 => encode_jpx_stream(image, width, height, quality),
-        ImageFormatChoice::Png => encode_pdf_flate_lossless(image, width, height),
+        ImageFormatChoice::Jpeg => {
+            encode_jpeg_stream_with_mode(image, width, height, quality, preview_fast)
+        }
+        ImageFormatChoice::Jpeg2000 => {
+            encode_jpx_stream_with_mode(image, width, height, effective_depth, quality)
+        }
+        ImageFormatChoice::Png => {
+            if effective_depth == ColorDepth::Bit1 {
+                encode_pdf_flate_1bit(image, width, height, preview_fast, scratch)
+            } else {
+                encode_pdf_flate_lossless_with_mode(image, width, height, preview_fast, scratch)
+            }
+        }
     }
 }
 
@@ -3569,27 +4158,38 @@ fn image_raw_luma_or_rgb(image: &DynamicImage) -> (Cow<'_, [u8]>, u8, &'static [
     }
 }
 
-fn encode_jpeg_stream(
+fn encode_jpeg_stream_with_mode(
     image: &DynamicImage,
     width: u32,
     height: u32,
     quality: u8,
+    preview_fast: bool,
 ) -> Result<EncodedPdfStream, PdfError> {
+    let encode_gray = if preview_fast {
+        encode_jpeg_gray_fast_preview
+    } else {
+        encode_jpeg_gray
+    };
+    let encode_rgb = if preview_fast {
+        encode_jpeg_rgb_fast_preview
+    } else {
+        encode_jpeg_rgb
+    };
     let (bytes, color_space_name) = match image {
         DynamicImage::ImageLuma8(gray) => (
-            encode_jpeg_gray(gray.as_raw(), width, height, quality)
+            encode_gray(gray.as_raw(), width, height, quality)
                 .map_err(|e| PdfError::ImageEncode(format!("JPEG grayscale encode: {e}")))?,
             b"DeviceGray".as_slice(),
         ),
         DynamicImage::ImageRgb8(rgb) => (
-            encode_jpeg_rgb(rgb.as_raw(), width, height, quality)
+            encode_rgb(rgb.as_raw(), width, height, quality)
                 .map_err(|e| PdfError::ImageEncode(format!("JPEG RGB encode: {e}")))?,
             b"DeviceRGB".as_slice(),
         ),
         _ => {
             let rgb = image.to_rgb8();
             (
-                encode_jpeg_rgb(rgb.as_raw(), width, height, quality)
+                encode_rgb(rgb.as_raw(), width, height, quality)
                     .map_err(|e| PdfError::ImageEncode(format!("JPEG RGB encode: {e}")))?,
                 b"DeviceRGB".as_slice(),
             )
@@ -3605,13 +4205,56 @@ fn encode_jpeg_stream(
     })
 }
 
-/// Encodes pixels as a native ISO 15444-1 JPEG 2000 codestream for PDF `/JPXDecode`.
-fn encode_jpx_stream(
+fn encode_jpeg_stream(
     image: &DynamicImage,
     width: u32,
     height: u32,
     quality: u8,
 ) -> Result<EncodedPdfStream, PdfError> {
+    encode_jpeg_stream_with_mode(image, width, height, quality, false)
+}
+
+/// Encodes pixels as a native ISO 15444-1 JPEG 2000 codestream for PDF `/JPXDecode`.
+fn encode_jpx_stream_with_mode(
+    image: &DynamicImage,
+    width: u32,
+    height: u32,
+    color_depth: ColorDepth,
+    quality: u8,
+) -> Result<EncodedPdfStream, PdfError> {
+    if color_depth == ColorDepth::Bit1 {
+        let gray = match image {
+            DynamicImage::ImageLuma8(g) => Cow::Borrowed(g.as_raw().as_slice()),
+            _ => Cow::Owned(image.to_luma8().into_raw()),
+        };
+        let bytes = encode_jpx_bilevel_1bit(&gray, width, height, quality).map_err(|e| {
+            PdfError::ImageEncode(format!("JPEG 2000 1-bit bi-level encode: {e}"))
+        })?;
+        return Ok(EncodedPdfStream {
+            bytes,
+            filter_name: b"JPXDecode",
+            color_space_name: b"DeviceGray",
+            decode_parms: None,
+            bits_per_component: 1,
+        });
+    }
+
+    if color_depth == ColorDepth::Hdr30 {
+        let rgb = match image {
+            DynamicImage::ImageRgb8(r) => Cow::Borrowed(r.as_raw().as_slice()),
+            _ => Cow::Owned(image.to_rgb8().into_raw()),
+        };
+        let bytes = encode_jpx_rgb_10bit(&rgb, width, height, quality)
+            .map_err(|e| PdfError::ImageEncode(format!("JPEG 2000 30-bit HDR encode: {e}")))?;
+        return Ok(EncodedPdfStream {
+            bytes,
+            filter_name: b"JPXDecode",
+            color_space_name: b"DeviceRGB",
+            decode_parms: None,
+            bits_per_component: 10,
+        });
+    }
+
     let (bytes, color_space_name) = match image {
         DynamicImage::ImageLuma8(gray) => (
             encode_jpx_gray(gray.as_raw(), width, height, quality)
@@ -3642,13 +4285,80 @@ fn encode_jpx_stream(
     })
 }
 
-/// Encodes lossless pixels as a valid PDF `/FlateDecode` stream.
-/// Uses PNG optimal row filtering (`PngEncoder` IDAT payload -> PDF `/Predictor 15`) when available,
-/// falling back to raw zlib compression if PNG chunk inspection does not match 8-bit L/RGB.
-fn encode_pdf_flate_lossless(
+fn encode_pdf_flate_1bit(
     image: &DynamicImage,
     width: u32,
     height: u32,
+    preview_fast: bool,
+    scratch: &mut ImageEncodeScratch,
+) -> Result<EncodedPdfStream, PdfError> {
+    let luma = match image {
+        DynamicImage::ImageLuma8(g) => Cow::Borrowed(g.as_raw().as_slice()),
+        _ => Cow::Owned(image.to_luma8().into_raw()),
+    };
+    let w = width as usize;
+    let h = height as usize;
+    let row_bytes = w.div_ceil(8);
+    let total_packed = row_bytes * h;
+    scratch.bit1_buf.clear();
+    scratch.bit1_buf.resize(total_packed, 0);
+
+    let luma_slice = &luma[..w * h];
+    luma_slice
+        .chunks_exact(w)
+        .zip(scratch.bit1_buf.chunks_exact_mut(row_bytes))
+        .for_each(|(src_row, dst_row)| {
+            let (full_chunks, rem) = src_row.as_chunks::<8>();
+            full_chunks
+                .iter()
+                .zip(dst_row.iter_mut())
+                .for_each(|(px8, dst)| {
+                    *dst = ((px8[0] >> 7) << 7)
+                        | ((px8[1] >> 7) << 6)
+                        | ((px8[2] >> 7) << 5)
+                        | ((px8[3] >> 7) << 4)
+                        | ((px8[4] >> 7) << 3)
+                        | ((px8[5] >> 7) << 2)
+                        | ((px8[6] >> 7) << 1)
+                        | (px8[7] >> 7);
+                });
+            if !rem.is_empty() {
+                let mut tail = 0u8;
+                rem.iter().enumerate().for_each(|(bit, &px)| {
+                    tail |= (px >> 7) << (7 - bit);
+                });
+                if let Some(last) = dst_row.last_mut() {
+                    *last = tail;
+                }
+            }
+        });
+
+    let zlib_comp = if preview_fast {
+        Compression::fast()
+    } else {
+        Compression::best()
+    };
+    let mut zlib = ZlibEncoder::new(Vec::new(), zlib_comp);
+    zlib.write_all(&scratch.bit1_buf)?;
+    let compressed = zlib.finish()?;
+    Ok(EncodedPdfStream {
+        bytes: compressed,
+        filter_name: b"FlateDecode",
+        color_space_name: b"DeviceGray",
+        decode_parms: None,
+        bits_per_component: 1,
+    })
+}
+
+/// Encodes lossless pixels as a valid PDF `/FlateDecode` stream.
+/// Uses PNG optimal row filtering (`PngEncoder` IDAT payload -> PDF `/Predictor 15`) when available,
+/// falling back to raw zlib compression if PNG chunk inspection does not match 8-bit L/RGB.
+fn encode_pdf_flate_lossless_with_mode(
+    image: &DynamicImage,
+    width: u32,
+    height: u32,
+    preview_fast: bool,
+    scratch: &mut ImageEncodeScratch,
 ) -> Result<EncodedPdfStream, PdfError> {
     let (raw_bytes, colors, color_space_name) = image_raw_luma_or_rgb(image);
     let ext_color = if colors == 1 {
@@ -3656,15 +4366,25 @@ fn encode_pdf_flate_lossless(
     } else {
         ExtendedColorType::Rgb8
     };
+    let png_comp = if preview_fast {
+        CompressionType::Fast
+    } else {
+        CompressionType::Best
+    };
+    let zlib_comp = if preview_fast {
+        Compression::fast()
+    } else {
+        Compression::best()
+    };
 
-    let mut png_buf = Vec::new();
+    scratch.png_buf.clear();
     let png_enc =
-        PngEncoder::new_with_quality(&mut png_buf, CompressionType::Best, PngFilterType::Adaptive);
+        PngEncoder::new_with_quality(&mut scratch.png_buf, png_comp, PngFilterType::Adaptive);
     png_enc
         .write_image(&raw_bytes, width, height, ext_color)
-        .map_err(|e| PdfError::ImageEncode(format!("PNG encode: {e}")))?;
+        .map_err(|e| pdf_encode_err(format!("PNG encode: {e}")))?;
 
-    if let Some((colors, idat_zlib)) = extract_png_idat_stream(&png_buf) {
+    if let Some((colors, idat_zlib)) = extract_png_idat_stream(&scratch.png_buf) {
         let decode_parms = dictionary! {
             "Predictor" => 15,
             "Colors" => colors as i64,
@@ -3680,7 +4400,7 @@ fn encode_pdf_flate_lossless(
         });
     }
 
-    let mut zlib = ZlibEncoder::new(Vec::new(), Compression::best());
+    let mut zlib = ZlibEncoder::new(Vec::new(), zlib_comp);
     zlib.write_all(&raw_bytes)?;
     let compressed = zlib.finish()?;
 
@@ -3691,6 +4411,15 @@ fn encode_pdf_flate_lossless(
         decode_parms: None,
         bits_per_component: 8,
     })
+}
+
+fn encode_pdf_flate_lossless(
+    image: &DynamicImage,
+    width: u32,
+    height: u32,
+) -> Result<EncodedPdfStream, PdfError> {
+    let mut scratch = ImageEncodeScratch::default();
+    encode_pdf_flate_lossless_with_mode(image, width, height, false, &mut scratch)
 }
 
 /// Extracts the concatenated `IDAT` zlib stream from a valid non-interlaced 8-bit Gray/RGB PNG.
@@ -3800,8 +4529,688 @@ fn apply_encoded_image_to_stream(
     stream
         .dict
         .set("Length", Object::Integer(encoded.bytes.len() as i64));
+    let _ = std::mem::take(&mut stream.content);
     stream.content = encoded.bytes;
     stream.allows_compression = false;
+}
+
+const DEFAULT_PREVIEW_RENDER_SCALE: f32 = 2.0;
+const MAX_PREVIEW_DIM_PX: f32 = 1600.0;
+const MAX_PREVIEW_AREA_PX: f32 = 2_500_000.0;
+const MAX_PREVIEW_TEXTURE_DIM: u32 = 4096;
+const MAX_ANCESTOR_DEPTH: usize = 256;
+
+#[derive(Debug, Clone)]
+pub struct PagePreviewData {
+    pub orig_width: u32,
+    pub orig_height: u32,
+    #[allow(dead_code)]
+    pub orig_stream_bytes: usize,
+    pub orig_rgba: Vec<u8>,
+    pub comp_width: u32,
+    pub comp_height: u32,
+    #[allow(dead_code)]
+    pub comp_stream_bytes: usize,
+    /// `None` when the compressed output is pixel-identical to the original.
+    pub comp_rgba: Option<Vec<u8>>,
+    pub kept_original: bool,
+}
+
+#[derive(Clone, Debug)]
+pub enum PreviewSource<'a> {
+    Path(&'a Path),
+    #[cfg(test)]
+    Bytes(&'a [u8]),
+    SharedBytes(Arc<Vec<u8>>),
+}
+
+struct CachedBaselinePage {
+    page_number: usize,
+    subset_doc: Document,
+    orig_stream_bytes: usize,
+    orig_width: u32,
+    orig_height: u32,
+    render_scale: f32,
+    orig_rgba: Vec<u8>,
+}
+
+/// Holds ONLY the single active previewed PDF's shared raw bytes (for direct Original `hayro`
+/// rasterization), parsed `Document`, and current page's 1-page subset baseline. Evicted
+/// immediately when switching files, clearing files, or unchecking `"Show Preview"`.
+#[derive(Default)]
+pub struct PreviewSessionCache {
+    source_id: Option<u64>,
+    source_path: Option<PathBuf>,
+    raw_bytes: Option<Arc<Vec<u8>>>,
+    doc: Option<Box<Document>>,
+    page: Option<Box<CachedBaselinePage>>,
+}
+
+impl PreviewSessionCache {
+    pub fn clear(&mut self) {
+        self.source_id = None;
+        self.source_path = None;
+        self.raw_bytes = None;
+        self.doc = None;
+        self.page = None;
+    }
+}
+
+fn subset_payload_stream_bytes(doc: &Document) -> usize {
+    doc.objects
+        .values()
+        .filter_map(|obj| match obj {
+            Object::Stream(s) => {
+                let stype = dict_get_resolved(doc, &s.dict, b"Type").and_then(obj_as_name);
+                if matches!(stype, Some(b"ObjStm") | Some(b"XRef")) {
+                    None
+                } else {
+                    Some(s.content.len())
+                }
+            }
+            _ => None,
+        })
+        .sum()
+}
+
+fn is_skipped_subset_dict_key(key: &[u8]) -> bool {
+    matches!(
+        key,
+        b"Parent"
+            | b"Prev"
+            | b"Next"
+            | b"First"
+            | b"Last"
+            | b"B"
+            | b"Dest"
+            | b"A"
+            | b"AA"
+            | b"SE"
+            | b"StructParent"
+            | b"StructParents"
+            | b"StructTreeRoot"
+            | b"Outlines"
+            | b"Threads"
+    )
+}
+
+fn is_other_page_or_pages_node(doc: &Document, id: ObjectId, target_page_id: ObjectId) -> bool {
+    let Ok(Object::Dictionary(dict)) = doc.get_object(id) else {
+        return false;
+    };
+    match dict_get_resolved(doc, dict, b"Type").and_then(obj_as_name) {
+        Some(b"Pages") => true,
+        Some(b"Page") => id != target_page_id,
+        _ => false,
+    }
+}
+
+/// Iteratively walks `root_obj` (using an explicit value stack â€” zero recursion) and enqueues
+/// every reachable `ObjectId` into `worklist` while guarding cycles via `visited` and skipping
+/// `/Parent`, page-tree, and sibling-page nodes.
+fn collect_refs_iterative<'a>(
+    root_obj: &'a Object,
+    doc: &Document,
+    target_page_id: ObjectId,
+    visited: &mut HashSet<ObjectId>,
+    worklist: &mut Vec<ObjectId>,
+) {
+    let mut stack: SmallVec<[&'a Object; 16]> = smallvec![root_obj];
+    while let Some(cur) = stack.pop() {
+        match cur {
+            Object::Reference(rid) => {
+                if *rid != target_page_id
+                    && !visited.contains(rid)
+                    && !is_other_page_or_pages_node(doc, *rid, target_page_id)
+                    && visited.insert(*rid)
+                {
+                    worklist.push(*rid);
+                }
+            }
+            Object::Array(arr) => {
+                arr.iter().for_each(|item| stack.push(item));
+            }
+            Object::Dictionary(dict) => {
+                dict.iter().for_each(|(k, v)| {
+                    if !is_skipped_subset_dict_key(k) {
+                        stack.push(v);
+                    }
+                });
+            }
+            Object::Stream(stream) => {
+                stream.dict.iter().for_each(|(k, v)| {
+                    if !is_skipped_subset_dict_key(k) {
+                        stack.push(v);
+                    }
+                });
+            }
+            _ => {}
+        }
+    }
+}
+
+fn merge_inherited_resources_dict(
+    doc: &Document,
+    target: &mut Dictionary,
+    ancestor: &Dictionary,
+) {
+    for (key, anc_val) in ancestor.iter() {
+        match target.get(key) {
+            Err(_) => {
+                target.set(key.clone(), anc_val.clone());
+            }
+            Ok(child_val) => {
+                if let (Some(Object::Dictionary(anc_sub)), Some(Object::Dictionary(mut child_sub))) = (
+                    resolve_obj(doc, anc_val),
+                    resolve_obj(doc, child_val).cloned(),
+                ) {
+                    let mut modified = false;
+                    for (sub_k, sub_v) in anc_sub.iter() {
+                        if child_sub.get(sub_k).is_err() {
+                            child_sub.set(sub_k.clone(), sub_v.clone());
+                            modified = true;
+                        }
+                    }
+                    if modified {
+                        target.set(key.clone(), Object::Dictionary(child_sub));
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Extracts a standalone 1-page PDF `Document` for 1-based `page_number` by copying ONLY
+/// objects reachable from page `page_number` using an iterative `Vec<ObjectId>` worklist and
+/// `HashSet<ObjectId>` cycle guard, with `/Parent` stripped before traversal and re-attached to
+/// a synthetic 1-page `/Pages` root.
+fn extract_single_page_subset(doc: &Document, page_number: usize) -> Result<Document, PdfError> {
+    let idx = page_number
+        .checked_sub(1)
+        .ok_or_else(|| PdfError::Parse(format!("Invalid page number {page_number}")))?;
+    let pages = doc.get_pages();
+    let total_pages = pages.len();
+    let Some(&page_id) = pages.values().nth(idx) else {
+        return Err(PdfError::Parse(format!(
+            "Page {page_number} out of range (total {total_pages})"
+        )));
+    };
+
+    // Walk ancestor `/Pages` nodes (bounded + cycle-guarded) only to inherit boxes/resources.
+    let mut ancestors: Vec<ObjectId> = Vec::new();
+    let mut seen_anc = HashSet::new();
+    let mut cur = page_id;
+    while ancestors.len() < MAX_ANCESTOR_DEPTH && seen_anc.insert(cur) {
+        ancestors.push(cur);
+        let Ok(Object::Dictionary(d)) = doc.get_object(cur) else {
+            break;
+        };
+        let Ok(parent_ref) = d.get(b"Parent").and_then(Object::as_reference) else {
+            break;
+        };
+        cur = parent_ref;
+    }
+    ancestors.reverse();
+
+    let mut page_dict = doc
+        .get_dictionary(page_id)
+        .map_err(|e| PdfError::Parse(format!("Invalid page dictionary: {e}")))?
+        .clone();
+
+    const INHERITABLE_KEYS: [&[u8]; 6] = [
+        b"MediaBox",
+        b"CropBox",
+        b"BleedBox",
+        b"TrimBox",
+        b"ArtBox",
+        b"Rotate",
+    ];
+    for key in INHERITABLE_KEYS {
+        if page_dict.get(key).is_err() {
+            for &anc_id in ancestors.iter().rev().skip(1) {
+                if let Ok(Object::Dictionary(anc_dict)) = doc.get_object(anc_id) {
+                    if let Ok(val) = anc_dict.get(key) {
+                        page_dict.set(key, val.clone());
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    // Materialize `/Resources` if inherited from any ancestor `/Pages` node.
+    let ancestor_res_dicts: Vec<Dictionary> = ancestors[..ancestors.len().saturating_sub(1)]
+        .iter()
+        .filter_map(|&anc_id| {
+            let Ok(Object::Dictionary(anc_dict)) = doc.get_object(anc_id) else {
+                return None;
+            };
+            let res_obj = anc_dict.get(b"Resources").ok()?;
+            match resolve_obj(doc, res_obj) {
+                Some(Object::Dictionary(d)) => Some(d.clone()),
+                _ => None,
+            }
+        })
+        .collect();
+    if !ancestor_res_dicts.is_empty() {
+        let mut merged = match page_dict
+            .get(b"Resources")
+            .ok()
+            .and_then(|o| resolve_obj(doc, o))
+        {
+            Some(Object::Dictionary(d)) => d.clone(),
+            _ => Dictionary::new(),
+        };
+        for anc_res in ancestor_res_dicts.iter().rev() {
+            merge_inherited_resources_dict(doc, &mut merged, anc_res);
+        }
+        page_dict.set("Resources", Object::Dictionary(merged));
+    }
+
+    // Explicitly strip `/Parent` and sibling/struct links before collecting reachable objects.
+    for drop_key in [
+        b"Parent".as_slice(),
+        b"Prev",
+        b"Next",
+        b"B",
+        b"StructParents",
+    ] {
+        page_dict.remove(drop_key);
+    }
+
+    let mut subset = Document::with_version(doc.version.clone());
+    subset.max_id = doc.max_id.max(1);
+
+    let mut visited: HashSet<ObjectId> = HashSet::from([page_id]);
+    let mut worklist: Vec<ObjectId> = Vec::new();
+    for (k, v) in page_dict.iter() {
+        if !is_skipped_subset_dict_key(k) {
+            collect_refs_iterative(v, doc, page_id, &mut visited, &mut worklist);
+        }
+    }
+
+    // Preserve catalog Optional Content Groups (`/OCProperties`) when present for MRC layers.
+    let oc_props = doc
+        .catalog()
+        .ok()
+        .and_then(|cat| cat.get(b"OCProperties").ok().cloned());
+    if let Some(ref oc) = oc_props {
+        collect_refs_iterative(oc, doc, page_id, &mut visited, &mut worklist);
+    }
+
+    while let Some(oid) = worklist.pop() {
+        let Ok(obj) = doc.get_object(oid) else {
+            continue;
+        };
+        let cloned = obj.clone();
+        collect_refs_iterative(&cloned, doc, page_id, &mut visited, &mut worklist);
+        subset.objects.insert(oid, cloned);
+    }
+
+    let new_pages_id = subset.new_object_id();
+    let new_catalog_id = subset.new_object_id();
+
+    page_dict.set("Parent", Object::Reference(new_pages_id));
+    subset.objects.insert(page_id, Object::Dictionary(page_dict));
+
+    subset.objects.insert(
+        new_pages_id,
+        Object::Dictionary(dictionary! {
+            "Type" => "Pages",
+            "Kids" => vec![Object::Reference(page_id)],
+            "Count" => 1,
+        }),
+    );
+
+    let mut catalog = dictionary! {
+        "Type" => "Catalog",
+        "Pages" => new_pages_id,
+    };
+    if let Some(oc) = oc_props {
+        catalog.set("OCProperties", oc);
+    }
+    subset
+        .objects
+        .insert(new_catalog_id, Object::Dictionary(catalog));
+    subset.trailer.set("Root", Object::Reference(new_catalog_id));
+    sync_all_stream_lengths(&mut subset);
+
+    Ok(subset)
+}
+
+fn compute_preview_render_scale(page_pt_w: f32, page_pt_h: f32) -> Result<f32, PdfError> {
+    if !page_pt_w.is_finite() || !page_pt_h.is_finite() || page_pt_w <= 0.0 || page_pt_h <= 0.0 {
+        return Err(PdfError::Parse("Invalid page dimensions for preview".to_string()));
+    }
+    let max_dim = page_pt_w.max(page_pt_h);
+    let min_dim = page_pt_w.min(page_pt_h);
+    let area = (page_pt_w as f64) * (page_pt_h as f64);
+    if !area.is_finite() || area <= 0.0 {
+        return Err(PdfError::Parse("Invalid page area for preview".to_string()));
+    }
+
+    let edge_cap_scale = MAX_PREVIEW_DIM_PX / max_dim;
+    let area_cap_scale = ((MAX_PREVIEW_AREA_PX as f64 / area).sqrt()) as f32;
+    let mut scale = edge_cap_scale
+        .min(area_cap_scale)
+        .min(DEFAULT_PREVIEW_RENDER_SCALE);
+
+    // Guard against float rounding exceeding MAX_PREVIEW_DIM_PX (1600 px) or MAX_PREVIEW_AREA_PX (2.5 MP).
+    while scale > 0.0 {
+        let w = (page_pt_w * scale) as u64;
+        let h = (page_pt_h * scale) as u64;
+        if w <= (MAX_PREVIEW_DIM_PX as u64)
+            && h <= (MAX_PREVIEW_DIM_PX as u64)
+            && w.saturating_mul(h) <= (MAX_PREVIEW_AREA_PX as u64)
+        {
+            break;
+        }
+        scale *= 0.995;
+    }
+
+    if scale <= 0.0 || !scale.is_finite() || (min_dim * scale) < 1.0 {
+        return Err(PdfError::Parse(
+            "Page aspect ratio too extreme for preview".to_string(),
+        ));
+    }
+    Ok(scale.clamp(0.01, DEFAULT_PREVIEW_RENDER_SCALE))
+}
+
+#[derive(Clone, Copy)]
+enum PreviewScaleMode {
+    MaxCap(f32),
+    Exact(f32),
+}
+
+const COMPLEX_PAGE_STREAM_THRESHOLD: usize = 30;
+const COMPLEX_PAGE_MAX_RENDER_SCALE: f32 = 1.25;
+
+fn rasterize_hayro_page(
+    pdf_bytes: Arc<Vec<u8>>,
+    page_idx: usize,
+    scale_mode: PreviewScaleMode,
+    is_cancelled: &dyn Fn() -> bool,
+) -> Result<(u32, u32, f32, Vec<u8>), PdfError> {
+    if is_cancelled() {
+        return Err(PdfError::Parse("Preview cancelled".to_string()));
+    }
+    let hayro_pdf = HayroPdf::new(pdf_bytes).map_err(|e| match e {
+        hayro::hayro_syntax::LoadPdfError::Decryption(_) => PdfError::Encrypted,
+        hayro::hayro_syntax::LoadPdfError::Invalid => {
+            PdfError::Parse("Failed to rasterize page preview".to_string())
+        }
+    })?;
+    let pages = hayro_pdf.pages();
+    let Some(page) = pages.get(page_idx) else {
+        return Err(PdfError::Parse(format!(
+            "Page {} out of range (total {})",
+            page_idx + 1,
+            pages.len()
+        )));
+    };
+    if is_cancelled() {
+        return Err(PdfError::Parse("Preview cancelled".to_string()));
+    }
+
+    let (pt_w, pt_h) = page.render_dimensions();
+    let scale = match scale_mode {
+        PreviewScaleMode::Exact(s) if s.is_finite() && s > 0.0 => s,
+        PreviewScaleMode::Exact(_) => compute_preview_render_scale(pt_w, pt_h)?,
+        PreviewScaleMode::MaxCap(cap) => compute_preview_render_scale(pt_w, pt_h)?.min(cap.max(0.01)),
+    };
+    let target_w = (pt_w * scale) as u32;
+    let target_h = (pt_h * scale) as u32;
+    if target_w == 0
+        || target_h == 0
+        || target_w > MAX_PREVIEW_TEXTURE_DIM
+        || target_h > MAX_PREVIEW_TEXTURE_DIM
+        || (target_w as u64).saturating_mul(target_h as u64) > (MAX_PREVIEW_AREA_PX as u64)
+    {
+        return Err(PdfError::Parse(
+            "Preview bitmap dimensions exceed safe GPU texture limits".to_string(),
+        ));
+    }
+
+    let cache = RenderCache::new();
+    let interpreter_settings = InterpreterSettings::default();
+    let render_settings = RenderSettings::default();
+    let pixmap_settings = PixmapSettings {
+        x_scale: scale,
+        y_scale: scale,
+        bg_color: WHITE,
+    };
+    let pixmap = hayro_render(
+        page,
+        &cache,
+        &interpreter_settings,
+        &render_settings,
+        &pixmap_settings,
+    );
+    let w = pixmap.width() as u32;
+    let h = pixmap.height() as u32;
+    if w == 0
+        || h == 0
+        || w > MAX_PREVIEW_TEXTURE_DIM
+        || h > MAX_PREVIEW_TEXTURE_DIM
+        || (w as u64).saturating_mul(h as u64) > (MAX_PREVIEW_AREA_PX as u64)
+    {
+        return Err(PdfError::Parse(
+            "Rendered preview bitmap exceeded safe GPU texture size".to_string(),
+        ));
+    }
+    let rgba = pixmap.take_rgba8(ImageAlphaType::Alpha);
+    Ok((w, h, scale, rgba))
+}
+
+/// Renders a single composed page preview using `cache`:
+/// - **Original Preview:** passed directly via shared `Arc<Vec<u8>>` into `hayro` with zero `lopdf`
+///   round-trip or re-serialization.
+/// - **Compressed Preview:** extracts only `page_number`'s reachable subset (with inherited `/Pages`
+///   attributes flattened before stripping `/Parent`), compresses that 1-page subset strictly
+///   sequentially (no nested thread pools), rasterizes with `hayro`, and immediately drops temporaries.
+pub fn render_page_preview_cached(
+    cache: &mut PreviewSessionCache,
+    source_id: u64,
+    source: PreviewSource<'_>,
+    page_number: usize,
+    options: &CompressionOptions,
+    is_cancelled: &dyn Fn() -> bool,
+) -> Result<PagePreviewData, PdfError> {
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if is_cancelled() {
+            return Err(PdfError::Parse("Preview cancelled".to_string()));
+        }
+
+        let path_changed = match &source {
+            PreviewSource::Path(p) => cache.source_path.as_deref() != Some(*p),
+            #[cfg(test)]
+            PreviewSource::Bytes(_) => cache.source_path.is_some(),
+            PreviewSource::SharedBytes(_) => cache.source_path.is_some(),
+        };
+        if cache.source_id != Some(source_id)
+            || path_changed
+            || cache.raw_bytes.is_none()
+            || cache.doc.is_none()
+        {
+            cache.clear();
+            let raw_bytes: Arc<Vec<u8>> = match source {
+                PreviewSource::Path(p) => {
+                    let meta = std::fs::metadata(p)?;
+                    if meta.len() == 0 {
+                        return Err(PdfError::Parse("The PDF file is empty (0 bytes).".to_string()));
+                    }
+                    cache.source_path = Some(p.to_path_buf());
+                    Arc::new(std::fs::read(p)?)
+                }
+                #[cfg(test)]
+                PreviewSource::Bytes(bytes) => {
+                    cache.source_path = None;
+                    Arc::new(bytes.to_vec())
+                }
+                PreviewSource::SharedBytes(shared) => {
+                    cache.source_path = None;
+                    shared
+                }
+            };
+            let doc = load_unencrypted_document(raw_bytes.as_slice())?;
+            cache.source_id = Some(source_id);
+            cache.raw_bytes = Some(raw_bytes);
+            cache.doc = Some(Box::new(doc));
+        }
+
+        if is_cancelled() {
+            return Err(PdfError::Parse("Preview cancelled".to_string()));
+        }
+
+        let need_baseline = cache
+            .page
+            .as_ref()
+            .is_none_or(|p| p.page_number != page_number);
+        if need_baseline {
+            cache.page = None;
+            let page_idx = page_number
+                .checked_sub(1)
+                .ok_or_else(|| PdfError::Parse(format!("Invalid page number {page_number}")))?;
+            let doc_ref = cache
+                .doc
+                .as_ref()
+                .ok_or_else(|| PdfError::Parse("Preview source unavailable".to_string()))?;
+            let subset_doc = extract_single_page_subset(doc_ref, page_number)?;
+            if is_cancelled() {
+                return Err(PdfError::Parse("Preview cancelled".to_string()));
+            }
+            let orig_stream_bytes = subset_payload_stream_bytes(&subset_doc);
+            let subset_stream_count = subset_doc
+                .objects
+                .values()
+                .filter(|o| matches!(o, Object::Stream(_)))
+                .count();
+            let scale_cap = if subset_stream_count > COMPLEX_PAGE_STREAM_THRESHOLD {
+                COMPLEX_PAGE_MAX_RENDER_SCALE
+            } else {
+                DEFAULT_PREVIEW_RENDER_SCALE
+            };
+
+            let raw_bytes_ref = cache
+                .raw_bytes
+                .as_ref()
+                .ok_or_else(|| PdfError::Parse("Preview bytes unavailable".to_string()))?;
+            let (orig_w, orig_h, render_scale, orig_rgba) = rasterize_hayro_page(
+                Arc::clone(raw_bytes_ref),
+                page_idx,
+                PreviewScaleMode::MaxCap(scale_cap),
+                is_cancelled,
+            )?;
+
+            cache.page = Some(Box::new(CachedBaselinePage {
+                page_number,
+                subset_doc,
+                orig_stream_bytes,
+                orig_width: orig_w,
+                orig_height: orig_h,
+                render_scale,
+                orig_rgba,
+            }));
+        }
+
+        if is_cancelled() {
+            return Err(PdfError::Parse("Preview cancelled".to_string()));
+        }
+
+        let baseline = cache
+            .page
+            .as_ref()
+            .ok_or_else(|| PdfError::Parse("Preview page baseline missing".to_string()))?;
+        let subset_clone = baseline.subset_doc.clone();
+        let (comp_pdf_bytes, comp_stats) = compress_subset_for_preview(
+            subset_clone,
+            baseline.orig_stream_bytes,
+            options,
+            is_cancelled,
+        )?;
+        let comp_stream_bytes = comp_stats.payload_stream_bytes;
+
+        if is_cancelled() {
+            return Err(PdfError::Parse("Preview cancelled".to_string()));
+        }
+
+        let (comp_w, comp_h, comp_rgba, kept_original) = if comp_pdf_bytes.is_empty()
+            || (comp_stats.images_recompressed == 0 && comp_stats.flate_streams_recompressed == 0)
+        {
+            (
+                baseline.orig_width,
+                baseline.orig_height,
+                None,
+                comp_stream_bytes >= baseline.orig_stream_bytes,
+            )
+        } else {
+            let (comp_w, comp_h, _scale, comp_rgba_raw) = rasterize_hayro_page(
+                Arc::new(comp_pdf_bytes),
+                0,
+                PreviewScaleMode::Exact(baseline.render_scale),
+                is_cancelled,
+            )?;
+            let pixels_identical = comp_w == baseline.orig_width
+                && comp_h == baseline.orig_height
+                && comp_rgba_raw == baseline.orig_rgba;
+            let comp_rgba = if pixels_identical {
+                None
+            } else {
+                Some(comp_rgba_raw)
+            };
+            (comp_w, comp_h, comp_rgba, pixels_identical && comp_stream_bytes >= baseline.orig_stream_bytes)
+        };
+
+        let orig_rgba = if need_baseline {
+            baseline.orig_rgba.clone()
+        } else {
+            Vec::new()
+        };
+
+        Ok(PagePreviewData {
+            orig_width: baseline.orig_width,
+            orig_height: baseline.orig_height,
+            orig_stream_bytes: baseline.orig_stream_bytes,
+            orig_rgba,
+            comp_width: comp_w,
+            comp_height: comp_h,
+            comp_stream_bytes,
+            comp_rgba,
+            kept_original,
+        })
+    }));
+
+    match result {
+        Ok(res) => res,
+        Err(_) => {
+            cache.clear();
+            Err(PdfError::Parse(
+                "Preview unavailable for this page".to_string(),
+            ))
+        }
+    }
+}
+
+/// In-memory single-call wrapper around [`render_page_preview_cached`] for tests.
+#[cfg(test)]
+pub fn render_page_preview_bytes(
+    input_bytes: &[u8],
+    page_number: usize,
+    options: &CompressionOptions,
+    is_cancelled: &dyn Fn() -> bool,
+) -> Result<PagePreviewData, PdfError> {
+    if input_bytes.is_empty() {
+        return Err(PdfError::Parse("The PDF file is empty (0 bytes).".to_string()));
+    }
+    let mut cache = PreviewSessionCache::default();
+    render_page_preview_cached(
+        &mut cache,
+        1,
+        PreviewSource::Bytes(input_bytes),
+        page_number,
+        options,
+        is_cancelled,
+    )
 }
 
 #[cfg(test)]
@@ -3945,6 +5354,7 @@ mod tests {
             quality: 50,
             scale: 0.5,
             resize_filter: ResizeFilterChoice::Lanczos3,
+            color_depth: ColorDepth::TrueColor24,
         };
 
         let (output, stats) = compress_pdf(&input, &opts, |_| {}).expect("compression succeeds");
@@ -4034,6 +5444,7 @@ mod tests {
                 quality: 50,
                 scale: 0.5,
                 resize_filter: ResizeFilterChoice::CatmullRom,
+            color_depth: ColorDepth::TrueColor24,
             };
             let (out, stats) = compress_pdf(&input, &opts, |_| {}).expect("compress succeeds");
             assert_eq!(stats.images_recompressed, 1);
@@ -4052,6 +5463,7 @@ mod tests {
             quality: 50,
             scale: 0.50,
             resize_filter: ResizeFilterChoice::Lanczos3,
+            color_depth: ColorDepth::TrueColor24,
         };
         let (out_cmyk, stats_cmyk) =
             compress_pdf(&cmyk_pdf, &opts, |_| {}).expect("cmyk compression succeeds");
@@ -4204,6 +5616,7 @@ mod tests {
             quality: 50,
             scale: 0.10,
             resize_filter: ResizeFilterChoice::Lanczos3,
+            color_depth: ColorDepth::TrueColor24,
         };
         let (out_mask, stats_mask) =
             compress_pdf(&mask_pdf, &low_scale_opts, |_| {}).expect("compress mask");
@@ -4695,18 +6108,21 @@ mod tests {
             quality: 50,
             scale: 1.0,
             resize_filter: ResizeFilterChoice::Lanczos3,
+            color_depth: ColorDepth::TrueColor24,
         });
         let est_q50_half = summary.estimate_compressed_bytes(&CompressionOptions {
             format: ImageFormatChoice::Jpeg,
             quality: 50,
             scale: 0.5,
             resize_filter: ResizeFilterChoice::Lanczos3,
+            color_depth: ColorDepth::TrueColor24,
         });
         let est_q50_quarter = summary.estimate_compressed_bytes(&CompressionOptions {
             format: ImageFormatChoice::Jpeg,
             quality: 50,
             scale: 0.25,
             resize_filter: ResizeFilterChoice::Lanczos3,
+            color_depth: ColorDepth::TrueColor24,
         });
         assert!(est_q50_full > est_q50_half);
         assert!(est_q50_half > est_q50_quarter);
@@ -4716,12 +6132,14 @@ mod tests {
             quality: 20,
             scale: 0.5,
             resize_filter: ResizeFilterChoice::Lanczos3,
+            color_depth: ColorDepth::TrueColor24,
         });
         let est_q90 = summary.estimate_compressed_bytes(&CompressionOptions {
             format: ImageFormatChoice::Jpeg,
             quality: 90,
             scale: 0.5,
             resize_filter: ResizeFilterChoice::Lanczos3,
+            color_depth: ColorDepth::TrueColor24,
         });
         assert!(est_q90 > est_q50_half);
         assert!(est_q50_half > est_q20);
@@ -4731,6 +6149,7 @@ mod tests {
             quality: 50,
             scale: 0.5,
             resize_filter: ResizeFilterChoice::Lanczos3,
+            color_depth: ColorDepth::TrueColor24,
         };
         let (actual_out, _) = compress_pdf(&input, &opts, |_| {}).expect("compress succeeds");
         let actual_len = actual_out.len() as f64;
@@ -4767,6 +6186,7 @@ mod tests {
             quality: 25,
             scale: 0.50,
             resize_filter: ResizeFilterChoice::Lanczos3,
+            color_depth: ColorDepth::TrueColor24,
         };
         let high_q_opts = CompressionOptions {
             quality: 85,
@@ -4785,6 +6205,7 @@ mod tests {
             quality: 50,
             scale: 0.30,
             resize_filter: ResizeFilterChoice::Lanczos3,
+            color_depth: ColorDepth::TrueColor24,
         };
         let large_scale_opts = CompressionOptions {
             scale: 0.65,
@@ -4805,6 +6226,7 @@ mod tests {
             quality: 65,
             scale: 0.50,
             resize_filter: ResizeFilterChoice::Lanczos3,
+            color_depth: ColorDepth::TrueColor24,
         };
         let mut opts_mid = baseline_q65.clone();
         synthetic_summary.apply_target_scale_first(&mut opts_mid, target_3mb);
@@ -4846,6 +6268,7 @@ mod tests {
             quality: 42,
             scale: 0.50,
             resize_filter: ResizeFilterChoice::Lanczos3,
+            color_depth: ColorDepth::TrueColor24,
         };
         synthetic_summary.apply_target_scale_first(&mut opts_png, target_3mb);
         assert_eq!(opts_png.quality, 42);
@@ -4953,6 +6376,7 @@ mod tests {
                 quality: 50,
                 scale: 0.5,
                 resize_filter: ResizeFilterChoice::Lanczos3,
+            color_depth: ColorDepth::TrueColor24,
             };
             let (out, stats) = compress_pdf(&gray_pdf, &opts, |_| {}).expect("compress gray");
             assert_eq!(stats.images_recompressed, 1, "fmt={:?} stats={:?}", fmt, stats);
@@ -5004,6 +6428,7 @@ mod tests {
                 quality: 50,
                 scale: 0.5,
                 resize_filter: ResizeFilterChoice::Lanczos3,
+            color_depth: ColorDepth::TrueColor24,
             };
             let (out, stats) = compress_pdf(&mono_pdf, &opts, |_| {}).expect("compress mono");
             assert_eq!(stats.images_skipped_small_or_mask, 1);
@@ -5071,6 +6496,7 @@ mod tests {
                     quality: 90,
                     scale,
                     resize_filter: ResizeFilterChoice::Lanczos3,
+            color_depth: ColorDepth::TrueColor24,
                 };
                 let est = summary.estimate_compressed_bytes(&opts);
                 assert!(
@@ -5134,6 +6560,7 @@ mod tests {
                     quality: 90,
                     scale,
                     resize_filter: ResizeFilterChoice::Lanczos3,
+            color_depth: ColorDepth::TrueColor24,
                 };
                 let est = summary8.estimate_compressed_bytes(&opts);
                 assert!(
@@ -5367,6 +6794,7 @@ mod tests {
             quality: 75,
             scale: 0.50,
             resize_filter: ResizeFilterChoice::Lanczos3,
+            color_depth: ColorDepth::TrueColor24,
         };
         let (out, stats) = compress_pdf(&pdf_bytes, &opts, |_| {}).expect("parallel compress");
         assert_eq!(stats.total_image_objects, 6);
@@ -5599,6 +7027,7 @@ mod tests {
             quality: 80,
             scale: 0.50,
             resize_filter: ResizeFilterChoice::Lanczos3,
+            color_depth: ColorDepth::TrueColor24,
         };
         assert!(summary.estimate_compressed_bytes(&opts) < pdf_bytes.len());
 
@@ -5752,6 +7181,7 @@ mod tests {
                 quality: q,
                 scale: 1.00,
                 resize_filter: ResizeFilterChoice::Lanczos3,
+            color_depth: ColorDepth::TrueColor24,
             };
             let est = rgb_summary.estimate_compressed_bytes(&opts);
             assert!(
@@ -5813,6 +7243,7 @@ mod tests {
             quality: 50,
             scale: 1.00,
             resize_filter: ResizeFilterChoice::Lanczos3,
+            color_depth: ColorDepth::TrueColor24,
         };
         let jpeg_q50_bytes = rgb_summary.estimate_compressed_bytes(&jpeg_q50_opts);
         let jpx_q50_est = rgb_summary.estimate_compressed_bytes(&CompressionOptions {
@@ -5845,6 +7276,7 @@ mod tests {
             quality: 50,
             scale: 0.50,
             resize_filter: ResizeFilterChoice::Lanczos3,
+            color_depth: ColorDepth::TrueColor24,
         };
         let (jpx_half_out, _) = compress_pdf(&rgb_pdf, &jpx_half_opts, |_| {}).unwrap();
         assert!(jpx_half_out.len() < jpx_q50_out.len());
@@ -5872,6 +7304,7 @@ mod tests {
                 quality: 25,
                 scale: 1.00,
                 resize_filter: ResizeFilterChoice::Lanczos3,
+            color_depth: ColorDepth::TrueColor24,
             };
             let est = summary.estimate_compressed_bytes(&png_opts);
             let (out, stats) = compress_pdf(src_pdf, &png_opts, |_| {}).expect("png compress");
@@ -5909,6 +7342,7 @@ mod tests {
                     quality: 80,
                     scale: 1.00,
                     resize_filter: ResizeFilterChoice::Lanczos3,
+            color_depth: ColorDepth::TrueColor24,
                 };
                 let (out_jg, stats_jg) = compress_pdf(src_pdf, &jpx_g_opts, |_| {}).unwrap();
                 assert_eq!(stats_jg.images_recompressed, 1);
@@ -5958,6 +7392,7 @@ mod tests {
             quality: 42,
             scale: 1.00,
             resize_filter: ResizeFilterChoice::Lanczos3,
+            color_depth: ColorDepth::TrueColor24,
         };
         synth.apply_target_scale_first(&mut png_solve, 3 * 1024 * 1024);
         assert!(png_solve.scale < 0.99);
@@ -5968,6 +7403,7 @@ mod tests {
             quality: 65,
             scale: 1.00,
             resize_filter: ResizeFilterChoice::Lanczos3,
+            color_depth: ColorDepth::TrueColor24,
         };
         synth.apply_target_scale_first(&mut jpx_solve, 3 * 1024 * 1024);
         assert!(jpx_solve.scale > 0.10 && jpx_solve.scale < 1.00);
@@ -6069,6 +7505,7 @@ mod tests {
                 quality,
                 scale,
                 resize_filter: ResizeFilterChoice::Lanczos3,
+            color_depth: ColorDepth::TrueColor24,
             };
             let est = scan_summary.estimate_compressed_bytes(&opts) as f64;
             let (out, stats) = compress_pdf(&scan_pdf, &opts, |_| {}).expect("compress scan");
@@ -6161,6 +7598,7 @@ mod tests {
             quality: 75,
             scale: 1.00,
             resize_filter: ResizeFilterChoice::Lanczos3,
+            color_depth: ColorDepth::TrueColor24,
         };
         let baseline_est = photo_summary.estimate_compressed_bytes(&baseline_opts);
 
@@ -6175,5 +7613,418 @@ mod tests {
         photo_summary.apply_target_scale_first(&mut solved_scale, target_55);
         assert!(solved_scale.scale < 1.00);
         assert!(photo_summary.estimate_compressed_bytes(&solved_scale) <= target_55);
+    }
+
+    #[test]
+    fn worker_pool_bounds_and_per_page_preview_extraction_work_accurately() {
+        let threads = worker_thread_count();
+        assert!((1..=4).contains(&threads));
+
+        // Build a 3-page PDF:
+        // Page 1: small 32x32 icon + primary 120x80 RGB image (must pick 120x80)
+        // Page 2: 96x64 RGB image nested inside a /Form XObject
+        // Page 3: vector-only text page (must return NoRasterImages)
+        let mut doc = Document::with_version("1.4");
+        let pages_id = doc.new_object_id();
+
+        let icon_px = vec![200u8; 32 * 32 * 3];
+        let icon_id = doc.add_object(Stream::new(
+            dictionary! {
+                "Type" => "XObject",
+                "Subtype" => "Image",
+                "Width" => 32,
+                "Height" => 32,
+                "ColorSpace" => "DeviceRGB",
+                "BitsPerComponent" => 8,
+            },
+            icon_px,
+        ));
+
+        let mut p1_px = vec![0u8; 120 * 80 * 3];
+        for y in 0..80usize {
+            for x in 0..120usize {
+                let p = (y * 120 + x) * 3;
+                p1_px[p] = ((x * 3) % 256) as u8;
+                p1_px[p + 1] = ((y * 5) % 256) as u8;
+                p1_px[p + 2] = (((x + y) * 7) % 256) as u8;
+            }
+        }
+        let p1_img_id = doc.add_object(Stream::new(
+            dictionary! {
+                "Type" => "XObject",
+                "Subtype" => "Image",
+                "Width" => 120,
+                "Height" => 80,
+                "ColorSpace" => "DeviceRGB",
+                "BitsPerComponent" => 8,
+            },
+            p1_px,
+        ));
+        let p1_res = doc.add_object(dictionary! {
+            "XObject" => dictionary! { "Icon" => icon_id, "Photo" => p1_img_id },
+        });
+        let p1_cont = doc.add_object(Stream::new(
+            dictionary! {},
+            b"q 32 0 0 32 0 0 cm /Icon Do Q q 300 0 0 200 50 100 cm /Photo Do Q".to_vec(),
+        ));
+        let page1_id = doc.add_object(dictionary! {
+            "Type" => "Page",
+            "Parent" => pages_id,
+            "MediaBox" => vec![0.into(), 0.into(), 612.into(), 792.into()],
+            "Resources" => p1_res,
+            "Contents" => p1_cont,
+        });
+
+        let form_img_px = vec![90u8; 96 * 64 * 3];
+        let form_img_id = doc.add_object(Stream::new(
+            dictionary! {
+                "Type" => "XObject",
+                "Subtype" => "Image",
+                "Width" => 96,
+                "Height" => 64,
+                "ColorSpace" => "DeviceRGB",
+                "BitsPerComponent" => 8,
+            },
+            form_img_px,
+        ));
+        let form_id = doc.add_object(Stream::new(
+            dictionary! {
+                "Type" => "XObject",
+                "Subtype" => "Form",
+                "BBox" => vec![0.into(), 0.into(), 200.into(), 200.into()],
+                "Resources" => dictionary! {
+                    "XObject" => dictionary! { "InnerImg" => form_img_id },
+                },
+            },
+            b"q 200 0 0 200 0 0 cm /InnerImg Do Q".to_vec(),
+        ));
+        let p2_res = doc.add_object(dictionary! {
+            "XObject" => dictionary! { "Fm1" => form_id },
+        });
+        let p2_cont = doc.add_object(Stream::new(dictionary! {}, b"/Fm1 Do".to_vec()));
+        let page2_id = doc.add_object(dictionary! {
+            "Type" => "Page",
+            "Parent" => pages_id,
+            "MediaBox" => vec![0.into(), 0.into(), 612.into(), 792.into()],
+            "Resources" => p2_res,
+            "Contents" => p2_cont,
+        });
+
+        let p3_font_id = doc.add_object(dictionary! {
+            "Type" => "Font",
+            "Subtype" => "Type1",
+            "BaseFont" => "Helvetica",
+        });
+        let p3_res = doc.add_object(dictionary! {
+            "Font" => dictionary! { "F1" => p3_font_id },
+        });
+        let p3_cont = doc.add_object(Stream::new(
+            dictionary! {},
+            b"0.1 0.1 0.1 rg 50 50 200 100 re f BT /F1 18 Tf 72 720 Td (Vector only page) Tj ET".to_vec(),
+        ));
+        let page3_id = doc.add_object(dictionary! {
+            "Type" => "Page",
+            "Parent" => pages_id,
+            "MediaBox" => vec![0.into(), 0.into(), 612.into(), 792.into()],
+            "Resources" => p3_res,
+            "Contents" => p3_cont,
+        });
+
+        doc.objects.insert(
+            pages_id,
+            Object::Dictionary(dictionary! {
+                "Type" => "Pages",
+                "Count" => 3,
+                "Kids" => vec![
+                    Object::Reference(page1_id),
+                    Object::Reference(page2_id),
+                    Object::Reference(page3_id),
+                ],
+            }),
+        );
+        let cat_id = doc.add_object(dictionary! { "Type" => "Catalog", "Pages" => pages_id });
+        doc.trailer.set("Root", cat_id);
+
+        let mut pdf_bytes = Vec::new();
+        doc.save_to(&mut pdf_bytes).expect("save preview test pdf");
+
+        for fmt in ImageFormatChoice::ALL {
+            let opts = CompressionOptions {
+                format: fmt,
+                quality: 65,
+                scale: 0.50,
+                resize_filter: ResizeFilterChoice::Lanczos3,
+            color_depth: ColorDepth::TrueColor24,
+            };
+            let data = render_page_preview_bytes(&pdf_bytes, 1, &opts, &|| false)
+                .expect("page 1 full-page preview");
+            assert_eq!((data.orig_width, data.orig_height), (1224, 1584));
+            assert_eq!((data.comp_width, data.comp_height), (1224, 1584));
+            assert_eq!(data.orig_rgba.len(), 1224 * 1584 * 4);
+            assert!(
+                data.comp_stream_bytes < data.orig_stream_bytes,
+                "compressed subset streams ({}) should shrink below original ({})",
+                data.comp_stream_bytes,
+                data.orig_stream_bytes
+            );
+            assert!(data.orig_rgba.as_chunks::<4>().0.iter().any(|px| px[0] < 250 || px[1] < 250 || px[2] < 250));
+        }
+
+        let p2_opts = CompressionOptions {
+            format: ImageFormatChoice::Jpeg,
+            quality: 60,
+            scale: 0.50,
+            resize_filter: ResizeFilterChoice::Lanczos3,
+            color_depth: ColorDepth::TrueColor24,
+        };
+        let p2_data = render_page_preview_bytes(&pdf_bytes, 2, &p2_opts, &|| false)
+            .expect("page 2 form full-page preview");
+        assert_eq!((p2_data.orig_width, p2_data.orig_height), (1224, 1584));
+        assert_eq!((p2_data.comp_width, p2_data.comp_height), (1224, 1584));
+        assert!(p2_data.comp_stream_bytes < p2_data.orig_stream_bytes);
+
+        let p3_data = render_page_preview_bytes(&pdf_bytes, 3, &CompressionOptions::default(), &|| false)
+            .expect("page 3 vector/text full-page preview");
+        assert_eq!((p3_data.orig_width, p3_data.orig_height), (1224, 1584));
+        assert_eq!((p3_data.comp_width, p3_data.comp_height), (1224, 1584));
+        assert!(
+            p3_data.orig_rgba.as_chunks::<4>().0.iter().any(|px| px[0] < 100 && px[1] < 100 && px[2] < 100),
+            "vector graphics and text on page 3 should rasterize visibly onto the page canvas"
+        );
+
+        // Multi-hundred-page (210 pages) `/Parent` tree isolation + oversized page `<= 1600 px` cap.
+        let mut big_doc = Document::with_version("1.5");
+        let big_pages_id = big_doc.new_object_id();
+        let mut kids = Vec::with_capacity(210);
+        for _ in 0..210usize {
+            let c_id = big_doc.add_object(Stream::new(
+                dictionary! {},
+                b"0.2 0.2 0.2 rg 100 100 400 300 re f".to_vec(),
+            ));
+            let p_id = big_doc.add_object(dictionary! {
+                "Type" => "Page",
+                "Parent" => big_pages_id,
+                "MediaBox" => vec![0.into(), 0.into(), 5000.into(), 4000.into()],
+                "Contents" => c_id,
+            });
+            kids.push(Object::Reference(p_id));
+        }
+        big_doc.objects.insert(
+            big_pages_id,
+            Object::Dictionary(dictionary! {
+                "Type" => "Pages",
+                "Count" => 210,
+                "Kids" => kids,
+            }),
+        );
+        let big_cat_id =
+            big_doc.add_object(dictionary! { "Type" => "Catalog", "Pages" => big_pages_id });
+        big_doc.trailer.set("Root", big_cat_id);
+
+        let subset = extract_single_page_subset(&big_doc, 105).expect("extract page 105");
+        assert_eq!(subset.get_pages().len(), 1);
+        assert!(
+            subset.objects.len() <= 6,
+            "1-page subset must strip /Parent and not pull 210 sibling pages (got {} objects)",
+            subset.objects.len()
+        );
+
+        let mut big_bytes = Vec::new();
+        big_doc.save_to(&mut big_bytes).expect("save 210-page pdf");
+        let mut session_cache = PreviewSessionCache::default();
+        let big_preview = render_page_preview_cached(
+            &mut session_cache,
+            99,
+            PreviewSource::Bytes(&big_bytes),
+            105,
+            &CompressionOptions::default(),
+            &|| false,
+        )
+        .expect("render 5000x4000pt page cleanly");
+        assert!(
+            big_preview.orig_width.max(big_preview.orig_height) <= 1600,
+            "longest edge {}x{} must be clamped <= 1600px",
+            big_preview.orig_width,
+            big_preview.orig_height
+        );
+        assert_eq!((big_preview.orig_width, big_preview.orig_height), (1600, 1280));
+        assert!(
+            (big_preview.orig_width as u64) * (big_preview.orig_height as u64) <= 2_500_000
+        );
+        session_cache.clear();
+
+        // Check both max-edge (1600px) and pixel-area (2.5 MP) caps across aspect ratios.
+        let s_square = compute_preview_render_scale(1600.0, 1600.0).expect("square scale");
+        let sq_w = (1600.0 * s_square) as u64;
+        let sq_h = (1600.0 * s_square) as u64;
+        assert!(sq_w <= 1600 && sq_h <= 1600 && sq_w * sq_h <= 2_500_000);
+
+        let s_tall = compute_preview_render_scale(800.0, 12_000.0).expect("tall scale");
+        let tall_w = (800.0 * s_tall) as u64;
+        let tall_h = (12_000.0 * s_tall) as u64;
+        assert!(tall_w <= 1600 && tall_h <= 1600 && tall_w * tall_h <= 2_500_000);
+
+        // Corrupt bytes return Err gracefully without panicking.
+        assert!(render_page_preview_bytes(b"not a pdf", 1, &CompressionOptions::default(), &|| false).is_err());
+
+        // Real-world multi-form/transparency-group PDF (`test/YouTube.pdf`) previews safely on 8 MB stack.
+        let yt_path = Path::new("test/YouTube.pdf");
+        if yt_path.exists() {
+            let handle = std::thread::Builder::new()
+                .name("yt_preview_test".to_string())
+                .stack_size(8 * 1024 * 1024)
+                .spawn(|| {
+                    let mut cache = PreviewSessionCache::default();
+                    let p1_default = render_page_preview_cached(
+                        &mut cache,
+                        101,
+                        PreviewSource::Path(Path::new("test/YouTube.pdf")),
+                        1,
+                        &CompressionOptions::default(),
+                        &|| false,
+                    )
+                    .expect("YouTube.pdf page 1 default Q100 preview");
+                    assert!(p1_default.orig_width.max(p1_default.orig_height) <= 1600);
+                    assert!(
+                        (p1_default.orig_width as u64) * (p1_default.orig_height as u64) <= 2_500_000
+                    );
+                    assert_eq!(
+                        p1_default.orig_rgba.len(),
+                        (p1_default.orig_width as usize) * (p1_default.orig_height as usize) * 4
+                    );
+
+                    let p1 = render_page_preview_cached(
+                        &mut cache,
+                        101,
+                        PreviewSource::Path(Path::new("test/YouTube.pdf")),
+                        1,
+                        &CompressionOptions {
+                            format: ImageFormatChoice::Jpeg,
+                            quality: 75,
+                            scale: 0.75,
+                            resize_filter: ResizeFilterChoice::Lanczos3,
+            color_depth: ColorDepth::TrueColor24,
+                        },
+                        &|| false,
+                    )
+                    .expect("YouTube.pdf page 1 Q75 preview");
+                    assert!(p1.orig_width.max(p1.orig_height) <= 1600);
+                    assert!((p1.orig_width as u64) * (p1.orig_height as u64) <= 2_500_000);
+                    assert!(p1.orig_rgba.is_empty(), "same-page update reuses GPU baseline");
+                    assert!(p1.comp_stream_bytes < p1.orig_stream_bytes);
+                })
+                .expect("spawn 8MB test thread");
+            handle.join().expect("join 8MB preview test thread");
+        }
+    }
+
+    #[test]
+    fn color_depth_encoding_and_estimation_work_across_formats() {
+        assert_eq!(
+            ColorDepth::supported_for(ImageFormatChoice::Jpeg),
+            &[ColorDepth::Gray8, ColorDepth::TrueColor24]
+        );
+        assert_eq!(
+            ColorDepth::supported_for(ImageFormatChoice::Jpeg2000),
+            &[
+                ColorDepth::Bit1,
+                ColorDepth::Gray8,
+                ColorDepth::HighColor16,
+                ColorDepth::TrueColor24,
+                ColorDepth::Hdr30
+            ]
+        );
+        assert_eq!(
+            ColorDepth::supported_for(ImageFormatChoice::Png),
+            &[
+                ColorDepth::Bit1,
+                ColorDepth::Gray8,
+                ColorDepth::HighColor16,
+                ColorDepth::TrueColor24
+            ]
+        );
+        assert_eq!(
+            ColorDepth::Hdr30.fallback_for(ImageFormatChoice::Jpeg),
+            ColorDepth::TrueColor24
+        );
+        assert_eq!(
+            ColorDepth::Bit1.fallback_for(ImageFormatChoice::Jpeg),
+            ColorDepth::TrueColor24
+        );
+        assert_eq!(
+            ColorDepth::Hdr30.fallback_for(ImageFormatChoice::Png),
+            ColorDepth::TrueColor24
+        );
+        assert_eq!(
+            ColorDepth::Gray8.fallback_for(ImageFormatChoice::Jpeg),
+            ColorDepth::Gray8
+        );
+
+        let rgb_bytes = test_noise_bytes(120 * 120 * 3, 0xCAFE_BABE_1234);
+        let pdf = build_test_pdf_with_image(120, 120, "DeviceRGB", rgb_bytes, false);
+        let summary = inspect_pdf(&pdf).expect("inspect color depth pdf");
+
+        let est = |fmt, depth| {
+            summary.estimate_compressed_bytes(&CompressionOptions {
+                format: fmt,
+                color_depth: depth,
+                quality: 80,
+                scale: 1.0,
+                resize_filter: ResizeFilterChoice::Lanczos3,
+            })
+        };
+        let e1 = est(ImageFormatChoice::Jpeg2000, ColorDepth::Bit1);
+        let e8 = est(ImageFormatChoice::Jpeg2000, ColorDepth::Gray8);
+        let e16 = est(ImageFormatChoice::Jpeg2000, ColorDepth::HighColor16);
+        let e24 = est(ImageFormatChoice::Jpeg2000, ColorDepth::TrueColor24);
+        let e30 = est(ImageFormatChoice::Jpeg2000, ColorDepth::Hdr30);
+        assert!(e1 < e8 && e8 < e16 && e16 < e24 && e24 < e30);
+
+        // Exercise real PDF compression for 1-bit PNG, 1-bit JPX, 8-bit Gray JPEG, 16-bit PNG, and 30-bit HDR JPX.
+        for (fmt, depth, expected_bpc, expected_cs) in [
+            (ImageFormatChoice::Png, ColorDepth::Bit1, 1i64, b"DeviceGray".as_slice()),
+            (ImageFormatChoice::Jpeg2000, ColorDepth::Bit1, 1i64, b"DeviceGray".as_slice()),
+            (ImageFormatChoice::Jpeg, ColorDepth::Gray8, 8i64, b"DeviceGray".as_slice()),
+            (ImageFormatChoice::Png, ColorDepth::HighColor16, 8i64, b"DeviceRGB".as_slice()),
+            (ImageFormatChoice::Jpeg2000, ColorDepth::Hdr30, 10i64, b"DeviceRGB".as_slice()),
+        ] {
+            let (out, stats) = compress_pdf(
+                &pdf,
+                &CompressionOptions {
+                    format: fmt,
+                    color_depth: depth,
+                    quality: 80,
+                    scale: 1.0,
+                    resize_filter: ResizeFilterChoice::Lanczos3,
+                },
+                |_| {},
+            )
+            .expect("compress with color depth");
+            assert_eq!(stats.images_recompressed, 1);
+
+            let out_doc = Document::load_mem(&out).expect("load compressed pdf");
+            let img_stream = out_doc
+                .objects
+                .values()
+                .find_map(|o| match o {
+                    Object::Stream(s)
+                        if dict_get_resolved(&out_doc, &s.dict, b"Subtype").and_then(obj_as_name)
+                            == Some(b"Image") =>
+                    {
+                        Some(s)
+                    }
+                    _ => None,
+                })
+                .expect("compressed image stream");
+            assert_eq!(
+                dict_get_resolved(&out_doc, &img_stream.dict, b"BitsPerComponent")
+                    .and_then(obj_as_i64),
+                Some(expected_bpc)
+            );
+            assert_eq!(
+                dict_get_resolved(&out_doc, &img_stream.dict, b"ColorSpace").and_then(obj_as_name),
+                Some(expected_cs)
+            );
+        }
     }
 }

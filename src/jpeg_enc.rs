@@ -7,29 +7,35 @@ use mozjpeg::{ColorSpace, Compress, Decompress, Format, Marker, ScanMode};
 const MAX_JPEG_DIM: usize = 65535;
 const CHROMA_444_QUALITY_THRESHOLD: u8 = 85;
 
+#[cold]
+fn cold_jpeg_err(msg: String) -> String {
+    msg
+}
+
 fn validate_dims(width: u32, height: u32, channels: usize, len: usize) -> Result<(), String> {
     if width == 0 || (width as usize) > MAX_JPEG_DIM {
-        return Err(format!(
+        return Err(cold_jpeg_err(format!(
             "Unsupported JPEG width {width} (must be 1..={MAX_JPEG_DIM})"
-        ));
+        )));
     }
     if height == 0 || (height as usize) > MAX_JPEG_DIM {
-        return Err(format!(
+        return Err(cold_jpeg_err(format!(
             "Unsupported JPEG height {height} (must be 1..={MAX_JPEG_DIM})"
-        ));
+        )));
     }
     let expected = (width as usize)
         .checked_mul(height as usize)
         .and_then(|px| px.checked_mul(channels))
-        .ok_or_else(|| "JPEG pixel buffer size overflow".to_string())?;
+        .ok_or_else(|| cold_jpeg_err("JPEG pixel buffer size overflow".to_string()))?;
     if len != expected {
-        return Err(format!(
+        return Err(cold_jpeg_err(format!(
             "Invalid JPEG buffer length: expected {expected} bytes for {width}x{height}x{channels}, got {len}"
-        ));
+        )));
     }
     Ok(())
 }
 
+#[cold]
 fn panic_payload_message(payload: Box<dyn std::any::Any + Send>) -> String {
     payload
         .downcast_ref::<&str>()
@@ -39,32 +45,37 @@ fn panic_payload_message(payload: Box<dyn std::any::Any + Send>) -> String {
         .to_string()
 }
 
-fn encode_mozjpeg(
+fn run_mozjpeg_pass(
     pixels: &[u8],
     width: u32,
     height: u32,
     color_space: ColorSpace,
-    channels: usize,
     quality: u8,
+    progressive: bool,
+    optimize_scans: bool,
 ) -> Result<Vec<u8>, String> {
-    validate_dims(width, height, channels, pixels.len())?;
-    let clamped_q = quality.clamp(1, 100);
-
     // MozJPEG reports internal libjpeg errors by unwinding through C frames.
     let result =
         std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> Result<Vec<u8>, String> {
             let mut comp = Compress::new(color_space);
             // Must come first: set_scan_optimization_mode resets defaults to JCP_MAX_COMPRESSION
             // (trellis quantization + overshoot deringing + progressive scan optimization).
-            comp.set_scan_optimization_mode(ScanMode::AllComponentsTogether);
+            if optimize_scans {
+                comp.set_scan_optimization_mode(ScanMode::AllComponentsTogether);
+            }
             comp.set_size(width as usize, height as usize);
-            comp.set_quality(f32::from(clamped_q));
-            comp.set_progressive_mode();
-            comp.set_optimize_scans(true);
+            comp.set_quality(f32::from(quality));
+            comp.set_optimize_scans(optimize_scans);
+            if !optimize_scans {
+                comp.set_use_scans_in_trellis(false);
+            }
+            if progressive {
+                comp.set_progressive_mode();
+            }
             comp.set_optimize_coding(true);
 
             if color_space == ColorSpace::JCS_RGB {
-                if clamped_q <= CHROMA_444_QUALITY_THRESHOLD {
+                if quality <= CHROMA_444_QUALITY_THRESHOLD {
                     comp.set_chroma_sampling_pixel_sizes((2, 2), (2, 2)); // 4:2:0
                 } else {
                     comp.set_chroma_sampling_pixel_sizes((1, 1), (1, 1)); // 4:4:4
@@ -91,6 +102,26 @@ fn encode_mozjpeg(
     }
 }
 
+fn encode_mozjpeg(
+    pixels: &[u8],
+    width: u32,
+    height: u32,
+    color_space: ColorSpace,
+    channels: usize,
+    quality: u8,
+) -> Result<Vec<u8>, String> {
+    validate_dims(width, height, channels, pixels.len())?;
+    let clamped_q = quality.clamp(1, 100);
+
+    // Try progressive scan optimization first; fall back without scan optimization or
+    // progressive scans if MozJPEG hits an internal Huffman table error on sparse inputs.
+    run_mozjpeg_pass(pixels, width, height, color_space, clamped_q, true, true)
+        .or_else(|_| run_mozjpeg_pass(pixels, width, height, color_space, clamped_q, true, false))
+        .or_else(|_| {
+            run_mozjpeg_pass(pixels, width, height, color_space, clamped_q, false, false)
+        })
+}
+
 /// Encodes an 8-bit grayscale (`L8`) buffer as a MozJPEG stream with trellis
 /// quantization and progressive scan optimization.
 pub fn encode_jpeg_gray(
@@ -114,6 +145,75 @@ pub fn encode_jpeg_rgb(
     encode_mozjpeg(rgb, width, height, ColorSpace::JCS_RGB, 3, quality)
 }
 
+fn encode_mozjpeg_fast_preview(
+    pixels: &[u8],
+    width: u32,
+    height: u32,
+    color_space: ColorSpace,
+    channels: usize,
+    quality: u8,
+) -> Result<Vec<u8>, String> {
+    validate_dims(width, height, channels, pixels.len())?;
+    let clamped_q = quality.clamp(1, 100);
+
+    let result =
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> Result<Vec<u8>, String> {
+            let mut comp = Compress::new(color_space);
+            comp.set_fastest_defaults();
+            comp.set_size(width as usize, height as usize);
+            comp.set_quality(f32::from(clamped_q));
+            comp.set_optimize_scans(false);
+            comp.set_optimize_coding(true);
+
+            if color_space == ColorSpace::JCS_RGB {
+                if clamped_q <= CHROMA_444_QUALITY_THRESHOLD {
+                    comp.set_chroma_sampling_pixel_sizes((2, 2), (2, 2)); // 4:2:0
+                } else {
+                    comp.set_chroma_sampling_pixel_sizes((1, 1), (1, 1)); // 4:4:4
+                }
+            }
+
+            let mut started = comp
+                .start_compress(Vec::new())
+                .map_err(|e| format!("MozJPEG fast preview start_compress failed: {e}"))?;
+            started
+                .write_scanlines(pixels)
+                .map_err(|e| format!("MozJPEG fast preview write_scanlines failed: {e}"))?;
+            started
+                .finish()
+                .map_err(|e| format!("MozJPEG fast preview finish failed: {e}"))
+        }));
+
+    match result {
+        Ok(inner) => inner,
+        Err(payload) => Err(format!(
+            "MozJPEG panicked during fast preview encoding: {}",
+            panic_payload_message(payload)
+        )),
+    }
+    .or_else(|_| encode_mozjpeg(pixels, width, height, color_space, channels, clamped_q))
+}
+
+/// Fast single-pass grayscale JPEG encoder for interactive preview updates.
+pub fn encode_jpeg_gray_fast_preview(
+    gray: &[u8],
+    width: u32,
+    height: u32,
+    quality: u8,
+) -> Result<Vec<u8>, String> {
+    encode_mozjpeg_fast_preview(gray, width, height, ColorSpace::JCS_GRAYSCALE, 1, quality)
+}
+
+/// Fast single-pass RGB JPEG encoder for interactive preview updates.
+pub fn encode_jpeg_rgb_fast_preview(
+    rgb: &[u8],
+    width: u32,
+    height: u32,
+    quality: u8,
+) -> Result<Vec<u8>, String> {
+    encode_mozjpeg_fast_preview(rgb, width, height, ColorSpace::JCS_RGB, 3, quality)
+}
+
 fn decode_cmyk_to_rgb(
     cmyk: &[u8],
     width: u32,
@@ -133,19 +233,30 @@ fn decode_cmyk_to_rgb(
         ));
     }
 
-    let mut rgb = Vec::with_capacity(pixel_count * 3);
-    for px in cmyk.chunks_exact(4) {
-        let (c, m, y, k) = (px[0] as u32, px[1] as u32, px[2] as u32, px[3] as u32);
-        if adobe_inverted {
-            rgb.push(((c * k + 127) / 255) as u8);
-            rgb.push(((m * k + 127) / 255) as u8);
-            rgb.push(((y * k + 127) / 255) as u8);
-        } else {
-            let inv_k = 255 - k;
-            rgb.push((((255 - c) * inv_k + 127) / 255) as u8);
-            rgb.push((((255 - m) * inv_k + 127) / 255) as u8);
-            rgb.push((((255 - y) * inv_k + 127) / 255) as u8);
-        }
+    let src = &cmyk[..expected];
+    let mut rgb = vec![0u8; pixel_count * 3];
+    if adobe_inverted {
+        src.as_chunks::<4>()
+            .0
+            .iter()
+            .zip(rgb.as_chunks_mut::<3>().0.iter_mut())
+            .for_each(|(px, dst)| {
+                let k = px[3] as u32;
+                dst[0] = ((px[0] as u32 * k + 127) / 255) as u8;
+                dst[1] = ((px[1] as u32 * k + 127) / 255) as u8;
+                dst[2] = ((px[2] as u32 * k + 127) / 255) as u8;
+            });
+    } else {
+        src.as_chunks::<4>()
+            .0
+            .iter()
+            .zip(rgb.as_chunks_mut::<3>().0.iter_mut())
+            .for_each(|(px, dst)| {
+                let inv_k = 255 - (px[3] as u32);
+                dst[0] = (((255 - (px[0] as u32)) * inv_k + 127) / 255) as u8;
+                dst[1] = (((255 - (px[1] as u32)) * inv_k + 127) / 255) as u8;
+                dst[2] = (((255 - (px[2] as u32)) * inv_k + 127) / 255) as u8;
+            });
     }
 
     RgbImage::from_raw(width, height, rgb)
@@ -387,7 +498,7 @@ mod tests {
         let mut flat_gray = vec![250u8; (w * h) as usize];
         for y in 0..h {
             for x in 0..w {
-                if (y % 120 == 20 && x >= 100 && x < 1500) || (x % 200 == 50 && y >= 100 && y < 1500) {
+                if (y % 120 == 20 && (100..1500).contains(&x)) || (x % 200 == 50 && (100..1500).contains(&y)) {
                     flat_gray[(y * w + x) as usize] = 35;
                 }
             }
@@ -423,5 +534,51 @@ mod tests {
             .expect("decode 1600x1600 gray")
             .to_luma8();
         assert_eq!(decoded.dimensions(), (w, h));
+    }
+
+    #[test]
+    fn encodes_sparse_high_contrast_rgb_blocks_at_q100_q85_q75_without_access_violation() {
+        // Guards against Windows LLP64 32-bit __builtin_ctzl(size_t) truncation in jcphuff.c
+        // where AC positions 1..32 are zero while positions 33..63 contain non-zero HF energy.
+        let w = 256u32;
+        let h = 256u32;
+        let mut sparse_rgb = vec![255u8; (w * h * 3) as usize];
+        for by in (0..h).step_by(8) {
+            for bx in (0..w).step_by(8) {
+                for dy in 0..8 {
+                    for dx in 0..8 {
+                        let y = by + dy;
+                        let x = bx + dx;
+                        let p = ((y * w + x) * 3) as usize;
+                        // Checkerboard / diagonal HF pattern localized inside 8x8 blocks on solid areas.
+                        if (bx / 8 + by / 8) % 3 == 0 {
+                            let val = if ((dx + dy) & 1) == 0 { 255u8 } else { 0u8 };
+                            sparse_rgb[p] = val;
+                            sparse_rgb[p + 1] = val;
+                            sparse_rgb[p + 2] = val;
+                        } else if dx == 7 && dy == 7 {
+                            sparse_rgb[p] = 16;
+                            sparse_rgb[p + 1] = 32;
+                            sparse_rgb[p + 2] = 240;
+                        }
+                    }
+                }
+            }
+        }
+
+        for q in [100u8, 85u8, 75u8] {
+            let full = encode_jpeg_rgb(&sparse_rgb, w, h, q).expect("full mozjpeg rgb");
+            let dec_full = decode_jpeg_to_image(&full)
+                .expect("decode full sparse rgb")
+                .to_rgb8();
+            assert_eq!(dec_full.dimensions(), (w, h));
+
+            let fast =
+                encode_jpeg_rgb_fast_preview(&sparse_rgb, w, h, q).expect("fast preview rgb");
+            let dec_fast = decode_jpeg_to_image(&fast)
+                .expect("decode fast sparse rgb")
+                .to_rgb8();
+            assert_eq!(dec_fast.dimensions(), (w, h));
+        }
     }
 }

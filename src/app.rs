@@ -1,25 +1,77 @@
 use std::collections::{BTreeSet, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::mpsc::{self, Receiver};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::Arc;
 use std::thread;
+use std::time::{Duration, Instant};
 
 use eframe::egui::{self, Color32, CornerRadius, Frame, Margin, RichText, Stroke};
+use smallvec::SmallVec;
 use rfd::FileDialog;
 
 use crate::pdf_processor::{
-    bytes_to_mb, compress_pdf, inspect_pdf, mb_to_bytes, CompressionOptions, CompressionStats,
-    ImageFormatChoice, PdfSummary, ProgressUpdate, ResizeFilterChoice,
+    bytes_to_mb, compress_pdf, compress_pdf_path, inspect_pdf, inspect_pdf_path, mb_to_bytes,
+    render_page_preview_cached, set_current_thread_below_normal, ColorDepth, CompressionOptions,
+    CompressionStats, ImageFormatChoice, PagePreviewData, PdfSummary, PreviewSessionCache,
+    PreviewSource, ProgressUpdate, ResizeFilterChoice,
 };
 
-pub const DEFAULT_WINDOW_WIDTH: f32 = 520.0;
-pub const DEFAULT_WINDOW_HEIGHT: f32 = 440.0;
-pub const MIN_WINDOW_WIDTH: f32 = 480.0;
-pub const MIN_WINDOW_HEIGHT: f32 = 420.0;
+fn next_file_source_id() -> u64 {
+    static NEXT_SOURCE_ID: AtomicU64 = AtomicU64::new(1);
+    NEXT_SOURCE_ID.fetch_add(1, Ordering::Relaxed)
+}
+
+const WORKER_STACK_BYTES: usize = 8 * 1024 * 1024;
+
+#[inline]
+fn spawn_worker_thread<F>(name: &str, f: F) -> bool
+where
+    F: FnOnce() + Send + 'static,
+{
+    spawn_worker_thread_boxed(name, Box::new(f))
+}
+
+fn spawn_worker_thread_boxed(name: &str, f: Box<dyn FnOnce() + Send + 'static>) -> bool {
+    thread::Builder::new()
+        .name(name.to_string())
+        .stack_size(WORKER_STACK_BYTES)
+        .spawn(f)
+        .is_ok()
+}
+
+pub const DEFAULT_WINDOW_WIDTH: f32 = 528.0;
+pub const DEFAULT_WINDOW_HEIGHT: f32 = 520.0;
+pub const MIN_WINDOW_WIDTH: f32 = 528.0;
+pub const MIN_WINDOW_HEIGHT: f32 = 520.0;
+#[cfg(test)]
+pub const PREVIEW_DEFAULT_WIDTH: f32 = 816.0;
+pub const PREVIEW_MIN_WIDTH: f32 = 320.0;
+#[cfg(test)]
+const MIN_PREVIEW_WINDOW_HEIGHT: f32 = 520.0;
+const PREVIEW_DEBOUNCE_MS: u64 = 120;
+
+fn dpi_scaled_widths(ctx: &egui::Context) -> (f32, f32) {
+    let monitor_w_pts = ctx
+        .input(|i| i.viewport().monitor_size.map(|m| m.x))
+        .filter(|w| w.is_finite() && *w > 0.0)
+        .unwrap_or_else(|| 1920.0 / ctx.pixels_per_point().max(1.0));
+    let main_width = monitor_w_pts * 0.275;
+    let default_preview_width = monitor_w_pts * 0.425;
+    (main_width, default_preview_width)
+}
 
 const FILE_TABLE_MAX_VISIBLE_ROWS: usize = 10;
-const SUMMARY_TABLE_MAX_VISIBLE_ROWS: usize = 6;
+const SUMMARY_TABLE_MIN_VISIBLE_ROWS: usize = 5;
+const SUMMARY_TABLE_MAX_VISIBLE_ROWS: usize = 10;
+
+fn summary_rows_height(rows: usize) -> f32 {
+    if rows == 0 {
+        0.0
+    } else {
+        (rows as f32) * TABLE_ROW_HEIGHT + (rows.saturating_sub(1) as f32) * TABLE_ROW_GAP
+    }
+}
 const TABLE_HEADER_HEIGHT: f32 = 24.0;
 const TABLE_ROW_HEIGHT: f32 = 24.0;
 const TABLE_ROW_GAP: f32 = 2.0;
@@ -62,6 +114,7 @@ impl TargetMode {
 #[derive(Clone, PartialEq)]
 struct CompressionSettings {
     options: CompressionOptions,
+    suffix: String,
     target_mode: TargetMode,
     target_size_mb: f32,
     target_size_pct: f32,
@@ -71,6 +124,7 @@ impl Default for CompressionSettings {
     fn default() -> Self {
         Self {
             options: CompressionOptions::default(),
+            suffix: "-compressed".to_string(),
             target_mode: TargetMode::Off,
             target_size_mb: 10.0,
             target_size_pct: 100.0,
@@ -161,15 +215,64 @@ impl CompressionResult {
 }
 
 struct PdfFileItem {
+    source_id: u64,
     path: Option<PathBuf>,
     file_name: String,
     original_size_mb: f64,
-    bytes: Arc<Vec<u8>>,
+    in_memory_bytes: Option<Arc<Vec<u8>>>,
     summary: PdfSummary,
     settings: CompressionSettings,
     cached_estimated_bytes: usize,
-    result: Option<CompressionResult>,
+    result: Option<Box<CompressionResult>>,
     error: Option<String>,
+}
+
+/// Tightly packed SoA numeric metrics kept separate from cold UI strings/paths so hot
+/// batch sizing/estimation scans iterate contiguous primitive arrays.
+#[derive(Default)]
+struct BatchHotMetrics {
+    orig_bytes: Vec<usize>,
+    compressible_bytes: Vec<usize>,
+    fixed_bytes: Vec<usize>,
+    pixel_area: Vec<u64>,
+    orig_mb: Vec<f32>,
+}
+
+impl BatchHotMetrics {
+    fn sync_from(&mut self, files: &[PdfFileItem]) {
+        let len = files.len();
+        self.orig_bytes.clear();
+        self.compressible_bytes.clear();
+        self.fixed_bytes.clear();
+        self.pixel_area.clear();
+        self.orig_mb.clear();
+        self.orig_bytes.reserve(len);
+        self.compressible_bytes.reserve(len);
+        self.fixed_bytes.reserve(len);
+        self.pixel_area.reserve(len);
+        self.orig_mb.reserve(len);
+        files.iter().for_each(|f| {
+            let orig = f.summary.file_bytes;
+            let fixed = f.summary.fixed_bytes.min(orig);
+            self.orig_bytes.push(orig);
+            self.fixed_bytes.push(fixed);
+            self.compressible_bytes.push(orig.saturating_sub(fixed));
+            self.pixel_area.push(
+                f.summary
+                    .compressible_rgb_pixels
+                    .saturating_add(f.summary.compressible_gray_pixels),
+            );
+            self.orig_mb.push(f.original_size_mb as f32);
+        });
+    }
+
+    fn max_orig_mb(&self) -> f32 {
+        self.orig_mb
+            .iter()
+            .copied()
+            .fold(0.0_f32, f32::max)
+            .max(1e-6)
+    }
 }
 
 impl PdfFileItem {
@@ -189,10 +292,122 @@ impl PdfFileItem {
 
 struct BatchJob {
     index: usize,
+    path: Option<PathBuf>,
+    in_memory_bytes: Option<Arc<Vec<u8>>>,
     original_size_mb: f64,
-    bytes: Arc<Vec<u8>>,
     settings: CompressionSettings,
     output_path: PathBuf,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PreviewFraming {
+    Fit,
+    Fill,
+    Center,
+}
+
+impl PreviewFraming {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Fit => "Fit",
+            Self::Fill => "Fill",
+            Self::Center => "Center",
+        }
+    }
+
+    fn next(self) -> Self {
+        match self {
+            Self::Fit => Self::Fill,
+            Self::Fill => Self::Center,
+            Self::Center => Self::Fit,
+        }
+    }
+
+    fn tooltip(self) -> &'static str {
+        match self {
+            Self::Fit => "Fit entire page inside pane (click to cycle: Fit → Fill → Center)",
+            Self::Fill => "Fill pane uniformly with page (click to cycle: Fit → Fill → Center)",
+            Self::Center => "Center page at 1.0× reference scale (click to cycle: Fit → Fill → Center)",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PreviewViewMode {
+    Framing(PreviewFraming),
+    FixedZoomPct(u16),
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct PreviewKey {
+    source_id: u64,
+    file_index: usize,
+    file_name: String,
+    path: Option<PathBuf>,
+    page_number: usize,
+    format: ImageFormatChoice,
+    color_depth: ColorDepth,
+    quality: u8,
+    scale_bits: u32,
+    resize_filter: ResizeFilterChoice,
+}
+
+impl PreviewKey {
+    fn from_item(file_index: usize, item: &PdfFileItem, page_number: usize) -> Self {
+        Self {
+            source_id: item.source_id,
+            file_index,
+            file_name: item.file_name.clone(),
+            path: item.path.clone(),
+            page_number,
+            format: item.settings.options.format,
+            color_depth: item.settings.options.color_depth,
+            quality: item.settings.options.quality,
+            scale_bits: item.settings.options.scale.to_bits(),
+            resize_filter: item.settings.options.resize_filter,
+        }
+    }
+
+    fn same_source_page(&self, other: &Self) -> bool {
+        self.source_id == other.source_id
+            && self.file_index == other.file_index
+            && self.file_name == other.file_name
+            && self.path == other.path
+            && self.page_number == other.page_number
+    }
+}
+
+struct PreviewDisplay {
+    key: PreviewKey,
+    orig_texture: Option<egui::TextureHandle>,
+    orig_width: u32,
+    orig_height: u32,
+    comp_texture: Option<egui::TextureHandle>,
+    comp_width: u32,
+    comp_height: u32,
+    kept_original: bool,
+    synthetic_empty: bool,
+    error: Option<String>,
+}
+
+struct PreviewWorkerEvent {
+    generation: u64,
+    key: PreviewKey,
+    outcome: Result<Option<Box<PagePreviewData>>, String>,
+}
+
+struct PreviewRenderRequest {
+    generation: u64,
+    key: PreviewKey,
+    path: Option<PathBuf>,
+    in_memory_bytes: Option<Arc<Vec<u8>>>,
+    options: CompressionOptions,
+    reply_ctx: egui::Context,
+}
+
+enum PreviewCommand {
+    Render(Box<PreviewRenderRequest>),
+    ClearCache,
 }
 
 enum WorkerEvent {
@@ -201,29 +416,23 @@ enum WorkerEvent {
         items: Vec<PdfFileItem>,
         errors: Vec<String>,
     },
-    SingleFinished(Result<(Vec<u8>, CompressionStats), String>),
     BatchItemFinished {
         index: usize,
-        outcome: Result<CompressionResult, String>,
+        outcome: Result<Box<CompressionResult>, String>,
     },
     BatchFinished {
         folder: PathBuf,
     },
 }
 
-struct PendingSave {
-    bytes: Vec<u8>,
-    stats: CompressionStats,
-    default_file_name: String,
-    initial_dir: Option<PathBuf>,
-}
-
 #[derive(Default, Clone, Copy)]
 struct SettingsDelta {
     format_changed: bool,
+    color_depth_changed: bool,
     quality_changed: bool,
     scale_changed: bool,
     filter_changed: bool,
+    suffix_changed: bool,
     target_mode_changed: bool,
     target_mode_activated: bool,
     target_mb_changed: bool,
@@ -233,9 +442,11 @@ struct SettingsDelta {
 impl SettingsDelta {
     fn any_changed(self) -> bool {
         self.format_changed
+            || self.color_depth_changed
             || self.quality_changed
             || self.scale_changed
             || self.filter_changed
+            || self.suffix_changed
             || self.target_mode_changed
             || self.target_mb_changed
             || self.target_pct_changed
@@ -244,6 +455,7 @@ impl SettingsDelta {
 
 pub struct PdfCompressorApp {
     files: Vec<PdfFileItem>,
+    hot_metrics: BatchHotMetrics,
     selected_indices: BTreeSet<usize>,
     selection_anchor: Option<usize>,
     apply_for_all: bool,
@@ -258,6 +470,27 @@ pub struct PdfCompressorApp {
     status_message: Option<String>,
     error_message: Option<String>,
     last_fitted_height: Option<f32>,
+    show_preview: bool,
+    preview_page: usize,
+    preview_page_edit_buf: String,
+    preview_framing: PreviewFraming,
+    preview_fixed_zoom: bool,
+    preview_zoom_pct: u16,
+    preview_zoom_exact: f32,
+    preview_zoom_editing: bool,
+    preview_zoom_just_started: bool,
+    preview_zoom_edit_buf: String,
+    preview_show_original_held: bool,
+    preview_scroll_offset: egui::Vec2,
+    preview_display: Option<Box<PreviewDisplay>>,
+    preview_pending_key: Option<PreviewKey>,
+    preview_pending_since: Option<Instant>,
+    preview_inflight_key: Option<PreviewKey>,
+    preview_generation: Arc<AtomicU64>,
+    preview_cmd_tx: Option<Sender<PreviewCommand>>,
+    preview_rx: Option<Receiver<PreviewWorkerEvent>>,
+    preview_panel_open: bool,
+    last_viewport_lock_state: Option<(bool, u32, u32)>,
     #[cfg(test)]
     last_content_width: f32,
     #[cfg(test)]
@@ -274,6 +507,7 @@ impl Default for PdfCompressorApp {
     fn default() -> Self {
         Self {
             files: Vec::new(),
+            hot_metrics: BatchHotMetrics::default(),
             selected_indices: BTreeSet::new(),
             selection_anchor: None,
             apply_for_all: false,
@@ -286,6 +520,27 @@ impl Default for PdfCompressorApp {
             status_message: None,
             error_message: None,
             last_fitted_height: None,
+            show_preview: false,
+            preview_page: 1,
+            preview_page_edit_buf: "1".to_string(),
+            preview_framing: PreviewFraming::Fit,
+            preview_fixed_zoom: false,
+            preview_zoom_pct: 100,
+            preview_zoom_exact: 100.0,
+            preview_zoom_editing: false,
+            preview_zoom_just_started: false,
+            preview_zoom_edit_buf: "100".to_string(),
+            preview_show_original_held: false,
+            preview_scroll_offset: egui::Vec2::ZERO,
+            preview_display: None,
+            preview_pending_key: None,
+            preview_pending_since: None,
+            preview_inflight_key: None,
+            preview_generation: Arc::new(AtomicU64::new(0)),
+            preview_cmd_tx: None,
+            preview_rx: None,
+            preview_panel_open: false,
+            last_viewport_lock_state: None,
             #[cfg(test)]
             last_content_width: 0.0,
             #[cfg(test)]
@@ -356,43 +611,78 @@ impl PdfCompressorApp {
         }
     }
 
+    fn clear_preview_textures(&mut self) {
+        self.preview_generation.fetch_add(1, Ordering::Relaxed);
+        if let Some(tx) = &self.preview_cmd_tx {
+            let _ = tx.send(PreviewCommand::ClearCache);
+        }
+        self.preview_display = None;
+        self.preview_pending_key = None;
+        self.preview_pending_since = None;
+        self.preview_inflight_key = None;
+        self.preview_show_original_held = false;
+    }
+
+    fn reset_preview_on_file_switch(&mut self) {
+        self.preview_page = 1;
+        self.preview_page_edit_buf = "1".to_string();
+        self.clear_preview_textures();
+    }
+
+    fn clear_files(&mut self) {
+        self.files.clear();
+        self.hot_metrics.sync_from(&self.files);
+        self.selected_indices.clear();
+        self.selection_anchor = None;
+        self.apply_for_all = false;
+        self.shared_target_size_mb = None;
+        self.batch_saved_folder = None;
+        self.status_message = None;
+        self.error_message = None;
+        self.reset_preview_on_file_switch();
+    }
+
+    fn build_loaded_item(
+        path: Option<PathBuf>,
+        file_name: String,
+        in_memory_bytes: Option<Arc<Vec<u8>>>,
+        summary: PdfSummary,
+    ) -> PdfFileItem {
+        let original_size_mb = bytes_to_mb(summary.file_bytes);
+        let settings = CompressionSettings::for_file(original_size_mb as f32);
+        let cached_estimated_bytes = summary.estimate_compressed_bytes(&settings.options);
+        PdfFileItem {
+            source_id: next_file_source_id(),
+            path,
+            file_name,
+            original_size_mb,
+            in_memory_bytes,
+            summary,
+            settings,
+            cached_estimated_bytes,
+            result: None,
+            error: None,
+        }
+    }
+
+    #[cfg(test)]
     fn inspect_loaded_inputs(
         inputs: Vec<(Option<PathBuf>, String, Vec<u8>)>,
         mut errors: Vec<String>,
         on_item: &(dyn Fn() + Sync),
     ) -> (Vec<PdfFileItem>, Vec<String>) {
-        let inspected: Vec<(
-            Option<PathBuf>,
-            String,
-            Vec<u8>,
-            Result<PdfSummary, crate::pdf_processor::PdfError>,
-        )> = inputs
-            .into_iter()
-            .map(|(path, file_name, bytes)| {
-                let summary_res = inspect_pdf(&bytes);
-                on_item();
-                (path, file_name, bytes, summary_res)
-            })
-            .collect();
-
-        let mut loaded_items = Vec::with_capacity(inspected.len());
-        for (path, file_name, bytes, summary_res) in inspected {
+        let mut loaded_items = Vec::with_capacity(inputs.len());
+        for (path, file_name, bytes) in inputs {
+            let summary_res = inspect_pdf(&bytes);
+            on_item();
             match summary_res {
                 Ok(summary) => {
-                    let original_size_mb = bytes_to_mb(summary.file_bytes);
-                    let settings = CompressionSettings::for_file(original_size_mb as f32);
-                    let cached_estimated_bytes = summary.estimate_compressed_bytes(&settings.options);
-                    loaded_items.push(PdfFileItem {
+                    loaded_items.push(Self::build_loaded_item(
                         path,
                         file_name,
-                        original_size_mb,
-                        bytes: Arc::new(bytes),
+                        Some(Arc::new(bytes)),
                         summary,
-                        settings,
-                        cached_estimated_bytes,
-                        result: None,
-                        error: None,
-                    });
+                    ));
                 }
                 Err(err) => {
                     errors.push(format!("{file_name}: {err}"));
@@ -406,6 +696,7 @@ impl PdfCompressorApp {
     fn apply_loaded_items(&mut self, loaded_items: Vec<PdfFileItem>, errors: Vec<String>) {
         if !loaded_items.is_empty() {
             self.files = loaded_items;
+            self.hot_metrics.sync_from(&self.files);
             self.selected_indices.clear();
             self.selected_indices.insert(0);
             self.selection_anchor = Some(0);
@@ -413,6 +704,7 @@ impl PdfCompressorApp {
             self.status_message = None;
             self.shared_target_size_mb = None;
             self.unloaded_settings = CompressionSettings::default();
+            self.reset_preview_on_file_switch();
         }
 
         self.error_message = if errors.is_empty() {
@@ -425,7 +717,7 @@ impl PdfCompressorApp {
     fn start_loading_job(
         &mut self,
         paths: Vec<PathBuf>,
-        mut inputs: Vec<(Option<PathBuf>, String, Vec<u8>)>,
+        inputs: Vec<(Option<PathBuf>, String, Vec<u8>)>,
         mut errors: Vec<String>,
         ctx: &egui::Context,
     ) {
@@ -440,28 +732,67 @@ impl PdfCompressorApp {
         });
 
         let repaint_ctx = ctx.clone();
-        thread::spawn(move || {
-            for path in paths {
-                match read_pdf_from_path(path) {
-                    Ok(entry) => inputs.push(entry),
-                    Err(err) => errors.push(err),
-                }
-            }
+        if !spawn_worker_thread("pdf_loader_worker", move || {
+            set_current_thread_below_normal();
+            let mut items = Vec::with_capacity(paths.len().saturating_add(inputs.len()));
+            let mut done: usize = 0;
 
-            let done_counter = AtomicUsize::new(0);
-            let total_inputs = inputs.len().max(1);
-            let (items, errors) = Self::inspect_loaded_inputs(inputs, errors, &|| {
-                let done = done_counter.fetch_add(1, Ordering::Relaxed) + 1;
+            // Parse disk-backed PDFs strictly one at a time without retaining raw bytes or Document.
+            for path in paths {
+                let file_name = path
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| "document.pdf".to_string());
+                match inspect_pdf_path(&path) {
+                    Ok(summary) => {
+                        items.push(Self::build_loaded_item(
+                            Some(path),
+                            file_name,
+                            None,
+                            summary,
+                        ));
+                    }
+                    Err(err) => {
+                        errors.push(format!("{file_name}: {err}"));
+                    }
+                }
+                done += 1;
                 let _ = tx.send(WorkerEvent::Progress(ProgressUpdate {
-                    current: done.min(total_inputs),
-                    total: total_inputs,
+                    current: done.min(total),
+                    total,
                 }));
                 repaint_ctx.request_repaint();
-            });
+            }
+
+            for (path, file_name, bytes) in inputs {
+                match inspect_pdf(&bytes) {
+                    Ok(summary) => {
+                        items.push(Self::build_loaded_item(
+                            path,
+                            file_name,
+                            Some(Arc::new(bytes)),
+                            summary,
+                        ));
+                    }
+                    Err(err) => {
+                        errors.push(format!("{file_name}: {err}"));
+                    }
+                }
+                done += 1;
+                let _ = tx.send(WorkerEvent::Progress(ProgressUpdate {
+                    current: done.min(total),
+                    total,
+                }));
+                repaint_ctx.request_repaint();
+            }
 
             let _ = tx.send(WorkerEvent::LoadFinished { items, errors });
             repaint_ctx.request_repaint();
-        });
+        }) {
+            self.worker_rx = None;
+            self.progress = None;
+            self.error_message = Some("Failed to start PDF loader worker thread.".to_string());
+        }
     }
 
     #[cfg(test)]
@@ -528,6 +859,7 @@ impl PdfCompressorApp {
             return;
         }
 
+        let prev_active = self.active_index();
         if modifiers.shift {
             let anchor = self
                 .selection_anchor
@@ -552,15 +884,23 @@ impl PdfCompressorApp {
             self.selected_indices.insert(index);
             self.selection_anchor = Some(index);
         }
+
+        if self.active_index() != prev_active {
+            self.reset_preview_on_file_switch();
+        }
     }
 
     fn select_all(&mut self) {
         if self.files.is_empty() {
             return;
         }
+        let prev_active = self.active_index();
         self.selected_indices = (0..self.files.len()).collect();
         if self.selection_anchor.is_none_or(|a| a >= self.files.len()) {
             self.selection_anchor = Some(0);
+        }
+        if self.active_index() != prev_active {
+            self.reset_preview_on_file_switch();
         }
     }
 
@@ -580,9 +920,9 @@ impl PdfCompressorApp {
         }
     }
 
-    fn affected_indices(&self) -> Vec<usize> {
+    fn affected_indices(&self) -> SmallVec<[usize; 8]> {
         if self.files.is_empty() {
-            return Vec::new();
+            return SmallVec::new();
         }
         if self.is_multi_file() && self.apply_for_all {
             (0..self.files.len()).collect()
@@ -606,12 +946,11 @@ impl PdfCompressorApp {
         }
 
         let apply_all = self.is_multi_file() && self.apply_for_all;
-        if apply_all && delta.target_mb_changed {
-            self.shared_target_size_mb = Some(draft.target_size_mb.max(0.0));
-        } else if apply_all
-            && delta.target_mode_changed
-            && draft.target_mode == TargetMode::Megabytes
-            && self.shared_target_size_mb.is_none()
+        if apply_all
+            && (delta.target_mb_changed
+                || (delta.target_mode_changed
+                    && draft.target_mode == TargetMode::Megabytes
+                    && self.shared_target_size_mb.is_none()))
         {
             self.shared_target_size_mb = Some(draft.target_size_mb.max(0.0));
         }
@@ -624,6 +963,17 @@ impl PdfCompressorApp {
 
             if delta.format_changed {
                 item.settings.options.format = draft.options.format;
+                item.settings.options.color_depth = item
+                    .settings
+                    .options
+                    .color_depth
+                    .fallback_for(draft.options.format);
+            }
+            if delta.color_depth_changed {
+                item.settings.options.color_depth = draft
+                    .options
+                    .color_depth
+                    .fallback_for(item.settings.options.format);
             }
             if delta.quality_changed {
                 item.settings.options.quality = draft.options.quality;
@@ -633,6 +983,9 @@ impl PdfCompressorApp {
             }
             if delta.filter_changed {
                 item.settings.options.resize_filter = draft.options.resize_filter;
+            }
+            if delta.suffix_changed {
+                item.settings.suffix = draft.suffix.clone();
             }
             if delta.target_mode_changed {
                 item.settings.target_mode = draft.target_mode;
@@ -673,44 +1026,7 @@ impl PdfCompressorApp {
         if self.files.is_empty() || self.is_busy() {
             return;
         }
-
-        if self.files.len() == 1 {
-            self.start_single_compression(ctx);
-        } else {
-            self.start_batch_compression(ctx);
-        }
-    }
-
-    fn start_single_compression(&mut self, ctx: &egui::Context) {
-        let Some(item) = self.files.first_mut() else {
-            return;
-        };
-
-        self.error_message = None;
-        self.status_message = None;
-        self.batch_saved_folder = None;
-        item.result = None;
-        item.error = None;
-
-        let bytes = Arc::clone(&item.bytes);
-        let options = item.settings.options.clone();
-        let (tx, rx) = mpsc::channel();
-        self.worker_rx = Some(rx);
-        self.progress = Some(ProgressUpdate {
-            current: 1,
-            total: 1,
-        });
-
-        let repaint_ctx = ctx.clone();
-        thread::spawn(move || {
-            let result = compress_pdf(&bytes, &options, |_| {
-                repaint_ctx.request_repaint();
-            })
-            .map_err(|e| e.to_string());
-
-            let _ = tx.send(WorkerEvent::SingleFinished(result));
-            repaint_ctx.request_repaint();
-        });
+        self.start_batch_compression(ctx);
     }
 
     fn start_batch_compression(&mut self, ctx: &egui::Context) {
@@ -746,8 +1062,9 @@ impl PdfCompressorApp {
             .enumerate()
             .map(|(index, (item, output_path))| BatchJob {
                 index,
+                path: item.path.clone(),
+                in_memory_bytes: item.in_memory_bytes.clone(),
                 original_size_mb: item.original_size_mb,
-                bytes: Arc::clone(&item.bytes),
                 settings: item.settings.clone(),
                 output_path,
             })
@@ -762,8 +1079,11 @@ impl PdfCompressorApp {
         });
 
         let repaint_ctx = ctx.clone();
-        thread::spawn(move || {
-            jobs.into_iter().for_each(|job| {
+        if !spawn_worker_thread("pdf_batch_compress_worker", move || {
+            set_current_thread_below_normal();
+            // Process strictly one PDF file at a time in sequential order so only one
+            // lopdf::Document and its output buffer ever reside in RAM.
+            for job in jobs {
                 let current_idx = (job.index + 1).min(total_jobs);
                 let _ = tx.send(WorkerEvent::Progress(ProgressUpdate {
                     current: current_idx,
@@ -771,30 +1091,41 @@ impl PdfCompressorApp {
                 }));
                 repaint_ctx.request_repaint();
 
-                let outcome = compress_pdf(&job.bytes, &job.settings.options, |_| {})
-                    .map_err(|e| e.to_string())
-                    .and_then(|(out_bytes, stats)| {
-                        std::fs::write(&job.output_path, &out_bytes).map_err(|e| {
-                            format!("Failed to save {}: {e}", job.output_path.display())
-                        })?;
-                        Ok(CompressionResult::from_stats(
-                            job.output_path,
-                            stats,
-                            &job.settings,
-                            job.original_size_mb,
-                        ))
-                    });
+                let compressed = if let Some(path) = &job.path {
+                    compress_pdf_path(path, &job.settings.options, |_| {})
+                        .map_err(|e| e.to_string())
+                } else if let Some(bytes) = &job.in_memory_bytes {
+                    compress_pdf(bytes, &job.settings.options, |_| {}).map_err(|e| e.to_string())
+                } else {
+                    Err("No PDF source available for compression.".to_string())
+                };
+
+                let outcome = compressed.and_then(|(out_bytes, stats)| {
+                    let write_res = write_pdf_bytes_safely(&job.output_path, &out_bytes);
+                    drop(out_bytes);
+                    write_res?;
+                    Ok(Box::new(CompressionResult::from_stats(
+                        job.output_path,
+                        stats,
+                        &job.settings,
+                        job.original_size_mb,
+                    )))
+                });
 
                 let _ = tx.send(WorkerEvent::BatchItemFinished {
                     index: job.index,
                     outcome,
                 });
                 repaint_ctx.request_repaint();
-            });
+            }
 
             let _ = tx.send(WorkerEvent::BatchFinished { folder });
             repaint_ctx.request_repaint();
-        });
+        }) {
+            self.worker_rx = None;
+            self.progress = None;
+            self.error_message = Some("Failed to start batch compression worker thread.".to_string());
+        }
     }
 
     fn poll_worker(&mut self) {
@@ -816,19 +1147,6 @@ impl PdfCompressorApp {
                     self.worker_rx = None;
                     self.progress = None;
                     self.apply_loaded_items(items, errors);
-                }
-                WorkerEvent::SingleFinished(result) => {
-                    self.worker_rx = None;
-                    self.progress = None;
-                    match result {
-                        Ok((out_bytes, stats)) => {
-                            let pending = self.build_pending_save(out_bytes, stats);
-                            self.prompt_save_as(pending);
-                        }
-                        Err(err) => {
-                            self.error_message = Some(err);
-                        }
-                    }
                 }
                 WorkerEvent::BatchItemFinished { index, outcome } => {
                     if let Some(item) = self.files.get_mut(index) {
@@ -883,67 +1201,6 @@ impl PdfCompressorApp {
         }
     }
 
-    fn build_pending_save(&self, bytes: Vec<u8>, stats: CompressionStats) -> PendingSave {
-        let (default_file_name, initial_dir) = match self.files.first() {
-            Some(item) => {
-                let stem = item_output_stem(item);
-                let dir = item
-                    .path
-                    .as_ref()
-                    .and_then(|p| p.parent().map(Path::to_path_buf));
-                (format!("{stem}_compressed.pdf"), dir)
-            }
-            None => ("compressed.pdf".to_string(), None),
-        };
-
-        PendingSave {
-            bytes,
-            stats,
-            default_file_name,
-            initial_dir,
-        }
-    }
-
-    fn prompt_save_as(&mut self, pending: PendingSave) {
-        let mut dialog = FileDialog::new()
-            .add_filter("PDF Document", &["pdf"])
-            .set_file_name(&pending.default_file_name);
-
-        if let Some(dir) = &pending.initial_dir {
-            dialog = dialog.set_directory(dir);
-        }
-
-        let summary_note = format_compression_summary_note(&pending.stats);
-        match dialog.save_file() {
-            Some(save_path) => match std::fs::write(&save_path, &pending.bytes) {
-                Ok(()) => {
-                    self.status_message = Some(format!(
-                        "Saved compressed PDF to {} ({summary_note})",
-                        save_path.display()
-                    ));
-                    if let Some(item) = self.files.first_mut() {
-                        item.result = Some(CompressionResult::from_stats(
-                            save_path,
-                            pending.stats,
-                            &item.settings,
-                            item.original_size_mb,
-                        ));
-                    }
-                }
-                Err(err) => {
-                    self.error_message =
-                        Some(format!("Compression succeeded, but saving failed: {err}"));
-                }
-            },
-            None => {
-                self.status_message = Some(format!(
-                    "Save cancelled (compressed output would have been {}; {summary_note}).",
-                    format_bytes(pending.stats.compressed_bytes)
-                ));
-            }
-        }
-    }
-
     fn render_file_card(&mut self, ui: &mut egui::Ui, busy: bool, is_hovered: bool) {
         let dark = ui.visuals().dark_mode;
         let card_fill = if is_hovered {
@@ -970,9 +1227,9 @@ impl PdfCompressorApp {
                 ui.set_width(ui.available_width());
                 ui.horizontal(|ui| {
                     let select_btn = egui::Button::new(
-                        RichText::new("Select PDF").size(14.5).strong(),
+                        RichText::new("Select").size(14.5).strong(),
                     )
-                    .min_size(egui::vec2(112.0, 38.0));
+                    .min_size(egui::vec2(100.0, 38.0));
 
                     if ui.add_enabled(!busy, select_btn).clicked() {
                         let ctx = ui.ctx().clone();
@@ -981,66 +1238,59 @@ impl PdfCompressorApp {
 
                     ui.add_space(10.0);
 
-                    const COMPRESS_BTN_WIDTH: f32 = 152.0;
+                    const COMPRESS_BTN_WIDTH: f32 = 124.0;
                     let middle_w = (ui.available_width() - COMPRESS_BTN_WIDTH - 12.0).max(80.0);
 
-                    if self.is_multi_file() {
+                    if !self.files.is_empty() {
+                        let cb_col_w = 114.0_f32.min(middle_w);
+                        ui.allocate_ui_with_layout(
+                            egui::vec2(middle_w, 42.0),
+                            egui::Layout::top_down(egui::Align::Center),
+                            |ui| {
+                                ui.allocate_ui_with_layout(
+                                    egui::vec2(cb_col_w, 42.0),
+                                    egui::Layout::top_down(egui::Align::Min),
+                                    |ui| {
+                                        ui.spacing_mut().item_spacing.y = 2.0;
+                                        if self.files.len() > 1 {
+                                            let prev = self.apply_for_all;
+                                            let resp = ui.add_enabled(
+                                                !busy,
+                                                egui::Checkbox::new(
+                                                    &mut self.apply_for_all,
+                                                    "Apply for ALL",
+                                                ),
+                                            );
+                                            if resp.changed() && self.apply_for_all && !prev {
+                                                self.sync_all_from_active();
+                                            } else if resp.changed() && !self.apply_for_all {
+                                                self.shared_target_size_mb = None;
+                                            }
+                                        } else {
+                                            let checkbox_row_height =
+                                                ui.spacing().interact_size.y;
+                                            ui.allocate_space(egui::vec2(
+                                                0.0,
+                                                checkbox_row_height,
+                                            ));
+                                        }
+                                        ui.checkbox(&mut self.show_preview, "Show Preview");
+                                    },
+                                );
+                            },
+                        );
+                    } else {
                         ui.allocate_ui_with_layout(
                             egui::vec2(middle_w, 38.0),
                             egui::Layout::top_down(egui::Align::Center),
                             |ui| {
-                                let interact_h = ui.spacing().interact_size.y;
-                                ui.add_space(((38.0 - interact_h) * 0.5).max(0.0));
-                                let prev = self.apply_for_all;
-                                let resp = ui.add_enabled(
-                                    !busy,
-                                    egui::Checkbox::new(&mut self.apply_for_all, "Apply for ALL"),
+                                ui.add_space(9.0);
+                                ui.add(
+                                    egui::Label::new(
+                                        RichText::new("No PDF selected").strong().size(14.5),
+                                    )
+                                    .truncate(),
                                 );
-                                if resp.changed() && self.apply_for_all && !prev {
-                                    self.sync_all_from_active();
-                                } else if resp.changed() && !self.apply_for_all {
-                                    self.shared_target_size_mb = None;
-                                }
-                            },
-                        );
-                    } else {
-                        let single = self.files.first();
-                        let middle_layout = if single.is_some() {
-                            egui::Layout::top_down(egui::Align::Min)
-                        } else {
-                            egui::Layout::left_to_right(egui::Align::Center)
-                        };
-                        ui.allocate_ui_with_layout(
-                            egui::vec2(middle_w, 38.0),
-                            middle_layout,
-                            |ui| {
-                                if let Some(loaded) = single {
-                                    ui.add(
-                                        egui::Label::new(
-                                            RichText::new(&loaded.file_name).strong().size(14.5),
-                                        )
-                                        .truncate(),
-                                    );
-                                    ui.add(
-                                        egui::Label::new(
-                                            RichText::new(format!(
-                                                "{} page(s) • {} image(s)",
-                                                loaded.summary.page_count,
-                                                loaded.summary.image_count
-                                            ))
-                                            .size(12.5)
-                                            .color(ui.visuals().weak_text_color()),
-                                        )
-                                        .truncate(),
-                                    );
-                                } else {
-                                    ui.add(
-                                        egui::Label::new(
-                                            RichText::new("No PDF selected").strong().size(14.5),
-                                        )
-                                        .truncate(),
-                                    );
-                                }
                             },
                         );
                     }
@@ -1048,7 +1298,7 @@ impl PdfCompressorApp {
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         let can_compress = !self.files.is_empty() && !busy;
                         let action_btn = egui::Button::new(
-                            RichText::new("Compress & Save")
+                            RichText::new("Compress")
                                 .size(14.5)
                                 .strong()
                                 .color(if can_compress {
@@ -1071,14 +1321,14 @@ impl PdfCompressorApp {
                     });
                 });
 
-                if self.is_multi_file() {
+                if !self.files.is_empty() {
                     ui.add_space(10.0);
-                    self.render_batch_file_table(ui, busy);
+                    self.render_file_table(ui, busy);
                 }
             });
     }
 
-    fn render_batch_file_table(&mut self, ui: &mut egui::Ui, busy: bool) {
+    fn render_file_table(&mut self, ui: &mut egui::Ui, busy: bool) {
         let dark = ui.visuals().dark_mode;
         let total_w = ui.available_width();
         let widths = file_table_col_widths(total_w);
@@ -1238,17 +1488,18 @@ impl PdfCompressorApp {
             None => self.unloaded_settings.clone(),
         };
 
+        if self.hot_metrics.orig_mb.len() != self.files.len() {
+            self.hot_metrics.sync_from(&self.files);
+        }
+
         let max_target_mb = if !has_files {
             10.0
         } else if self.is_multi_file() && self.apply_for_all {
-            self.files
-                .iter()
-                .map(|f| f.original_size_mb as f32)
-                .fold(0.0_f32, f32::max)
-                .max(1e-6)
+            self.hot_metrics.max_orig_mb()
         } else {
             active_idx
-                .map(|idx| (self.files[idx].original_size_mb as f32).max(1e-6))
+                .and_then(|idx| self.hot_metrics.orig_mb.get(idx).copied())
+                .map(|mb| mb.max(1e-6))
                 .unwrap_or(10.0)
         };
 
@@ -1259,45 +1510,30 @@ impl PdfCompressorApp {
             .inner_margin(Margin::same(14))
             .show(ui, |ui| {
                 ui.set_width(ui.available_width());
-                ui.label(RichText::new("Compression & Resize Settings").strong().size(15.0));
+                ui.label(RichText::new("Compression").strong().size(15.0));
                 ui.add_space(8.0);
 
                 let mut delta = SettingsDelta::default();
 
                 ui.add_enabled_ui(!busy && has_editable_target, |ui| {
-                    // Format / Algorithm dropdown
+                    const LABEL_COL_W: f32 = 158.0;
+                    const VALUE_BOX_W: f32 = 64.0;
+                    const GRID_GAP_X: f32 = 8.0;
+                    const GRID_GAP_Y: f32 = 8.0;
+                    let row_h = ui.spacing().interact_size.y.max(22.0);
+                    let item_gap = ui.spacing().item_spacing.x;
+                    let col1_w = (ui.available_width() - LABEL_COL_W - GRID_GAP_X).max(160.0);
+                    let fixed_slider_width =
+                        (col1_w - VALUE_BOX_W - item_gap - 18.0).clamp(80.0, 260.0);
+
+                    let prev_filter = draft.options.resize_filter;
                     let prev_format = draft.options.format;
-                    ui.horizontal(|ui| {
-                        ui.label("Image Format:");
-                        egui::ComboBox::from_id_salt("image_format_selector")
-                            .selected_text(draft.options.format.label())
-                            .width(105.0)
-                            .show_ui(ui, |ui| {
-                                for fmt in ImageFormatChoice::ALL {
-                                    ui.selectable_value(
-                                        &mut draft.options.format,
-                                        fmt,
-                                        fmt.label(),
-                                    );
-                                }
-                            });
-                    });
-                    if draft.options.format != prev_format {
-                        delta.format_changed = true;
-                    }
-
-                    ui.add_space(10.0);
-
-                    // Quality Factor + Resolution Scale aligned cleanly in a 2-column grid
+                    let prev_depth = draft.options.color_depth;
+                    let prev_suffix = draft.suffix.clone();
                     let uses_quality = draft.options.format.uses_quality();
                     let prev_quality = draft.options.quality;
                     let prev_scale = draft.options.scale;
-                    let item_gap = ui.spacing().item_spacing.x;
-                    let value_box_w = 56.0_f32;
-                    let drag_h = ui.spacing().interact_size.y;
-                    let slider_track_w =
-                        (ui.available_width() - 122.0 - 8.0 - value_box_w - item_gap)
-                            .clamp(120.0, 260.0);
+
                     #[cfg(test)]
                     let mut captured_q_slider = None;
                     #[cfg(test)]
@@ -1307,13 +1543,126 @@ impl PdfCompressorApp {
                     #[cfg(test)]
                     let mut captured_s_drag = None;
 
-                    egui::Grid::new("quality_scale_sliders_grid")
+                    egui::Grid::new("compression_controls_grid")
                         .num_columns(2)
-                        .spacing([8.0, 8.0])
+                        .spacing([GRID_GAP_X, GRID_GAP_Y])
                         .show(ui, |ui| {
-                            ui.label("Quality Factor:");
+                            // 1. Resize Filter
+                            ui.allocate_ui_with_layout(
+                                egui::vec2(LABEL_COL_W, row_h),
+                                egui::Layout::left_to_right(egui::Align::Center),
+                                |ui| {
+                                    ui.label("Resize Filter:");
+                                },
+                            );
                             ui.horizontal(|ui| {
-                                ui.spacing_mut().slider_width = slider_track_w;
+                                for filter in ResizeFilterChoice::ALL {
+                                    let selected = draft.options.resize_filter == filter;
+                                    if ui.selectable_label(selected, filter.label()).clicked() {
+                                        draft.options.resize_filter = filter;
+                                    }
+                                }
+                            });
+                            ui.end_row();
+                            if draft.options.resize_filter != prev_filter {
+                                delta.filter_changed = true;
+                            }
+
+                            // 2. Image Format
+                            ui.allocate_ui_with_layout(
+                                egui::vec2(LABEL_COL_W, row_h),
+                                egui::Layout::left_to_right(egui::Align::Center),
+                                |ui| {
+                                    ui.label("Image Format:");
+                                },
+                            );
+                            egui::ComboBox::from_id_salt("image_format_selector")
+                                .selected_text(draft.options.format.label())
+                                .width(155.0)
+                                .show_ui(ui, |ui| {
+                                    for fmt in ImageFormatChoice::ALL {
+                                        ui.selectable_value(
+                                            &mut draft.options.format,
+                                            fmt,
+                                            fmt.label(),
+                                        );
+                                    }
+                                });
+                            ui.end_row();
+                            if draft.options.format != prev_format {
+                                delta.format_changed = true;
+                                draft.options.color_depth = draft
+                                    .options
+                                    .color_depth
+                                    .fallback_for(draft.options.format);
+                            }
+
+                            // 3. Color Depth
+                            ui.allocate_ui_with_layout(
+                                egui::vec2(LABEL_COL_W, row_h),
+                                egui::Layout::left_to_right(egui::Align::Center),
+                                |ui| {
+                                    ui.label("Color Depth:");
+                                },
+                            );
+                            let supported_depths = ColorDepth::supported_for(draft.options.format);
+                            egui::ComboBox::from_id_salt("color_depth_selector")
+                                .selected_text(draft.options.color_depth.label())
+                                .width(155.0)
+                                .show_ui(ui, |ui| {
+                                    for &depth in supported_depths {
+                                        ui.selectable_value(
+                                            &mut draft.options.color_depth,
+                                            depth,
+                                            depth.label(),
+                                        );
+                                    }
+                                });
+                            ui.end_row();
+                            if draft.options.color_depth != prev_depth {
+                                delta.color_depth_changed = true;
+                            }
+
+                            // 4. Name Suffix
+                            ui.allocate_ui_with_layout(
+                                egui::vec2(LABEL_COL_W, row_h),
+                                egui::Layout::left_to_right(egui::Align::Center),
+                                |ui| {
+                                    ui.label("Name Suffix:");
+                                },
+                            );
+                            let suffix_box_fill = ui.visuals().widgets.inactive.bg_fill;
+                            let suffix_box_stroke = ui.visuals().widgets.inactive.bg_stroke;
+                            let suffix_frame_resp = Frame::new()
+                                .fill(suffix_box_fill)
+                                .stroke(suffix_box_stroke)
+                                .corner_radius(CornerRadius::same(4))
+                                .inner_margin(Margin::symmetric(6, 2))
+                                .show(ui, |ui| {
+                                    ui.add_sized(
+                                        [143.0, (row_h - 6.0).max(14.0)],
+                                        egui::TextEdit::singleline(&mut draft.suffix)
+                                            .frame(Frame::NONE)
+                                            .margin(Margin::ZERO)
+                                            .background_color(Color32::TRANSPARENT)
+                                            .hint_text("(original filename)"),
+                                    )
+                                });
+                            if suffix_frame_resp.inner.changed() && draft.suffix != prev_suffix {
+                                delta.suffix_changed = true;
+                            }
+                            ui.end_row();
+
+                            // 5. Quality Factor
+                            ui.allocate_ui_with_layout(
+                                egui::vec2(LABEL_COL_W, row_h),
+                                egui::Layout::left_to_right(egui::Align::Center),
+                                |ui| {
+                                    ui.label("Quality Factor:");
+                                },
+                            );
+                            ui.horizontal(|ui| {
+                                ui.spacing_mut().slider_width = fixed_slider_width;
                                 let slider = egui::Slider::new(&mut draft.options.quality, 1..=100)
                                     .show_value(false)
                                     .clamping(egui::SliderClamping::Always);
@@ -1325,7 +1674,7 @@ impl PdfCompressorApp {
                                 let quality_drag_resp = ui
                                     .add_enabled_ui(uses_quality, |ui| {
                                         ui.add_sized(
-                                            [value_box_w, drag_h],
+                                            [VALUE_BOX_W, row_h],
                                             egui::DragValue::new(&mut draft.options.quality)
                                                 .range(1..=100)
                                                 .speed(0.5),
@@ -1349,9 +1698,16 @@ impl PdfCompressorApp {
                             });
                             ui.end_row();
 
-                            ui.label("Resolution Scale:");
+                            // 6. Resolution Scale
+                            ui.allocate_ui_with_layout(
+                                egui::vec2(LABEL_COL_W, row_h),
+                                egui::Layout::left_to_right(egui::Align::Center),
+                                |ui| {
+                                    ui.label("Resolution Scale:");
+                                },
+                            );
                             ui.horizontal(|ui| {
-                                ui.spacing_mut().slider_width = slider_track_w;
+                                ui.spacing_mut().slider_width = fixed_slider_width;
                                 let scale_slider_resp = ui.add(
                                     egui::Slider::new(&mut draft.options.scale, 0.10..=1.00)
                                         .step_by(0.01)
@@ -1359,12 +1715,11 @@ impl PdfCompressorApp {
                                         .clamping(egui::SliderClamping::Edits),
                                 );
                                 let scale_drag_resp = ui.add_sized(
-                                    [value_box_w, drag_h],
+                                    [VALUE_BOX_W, row_h],
                                     egui::DragValue::new(&mut draft.options.scale)
                                         .range(0.10..=1.00)
                                         .speed(0.01)
-                                        .fixed_decimals(2)
-                                        .suffix("x"),
+                                        .fixed_decimals(2),
                                 );
                                 #[cfg(test)]
                                 {
@@ -1378,7 +1733,130 @@ impl PdfCompressorApp {
                                 }
                             });
                             ui.end_row();
+
+                            // 7. Target Size / Estimated Size
+                            let prev_mode = draft.target_mode;
+                            ui.allocate_ui_with_layout(
+                                egui::vec2(LABEL_COL_W, row_h),
+                                egui::Layout::left_to_right(egui::Align::Center),
+                                |ui| {
+                                    ui.set_min_width(LABEL_COL_W);
+                                    let mut cb_checked = prev_mode.is_enabled();
+                                    let cb_resp = ui.checkbox(&mut cb_checked, prev_mode.label());
+                                    if cb_resp.changed() {
+                                        let next_mode = prev_mode.next();
+                                        draft.target_mode = next_mode;
+                                        delta.target_mode_changed = true;
+                                        delta.target_mode_activated = next_mode.is_enabled();
+                                        if prev_mode == TargetMode::Megabytes
+                                            && next_mode == TargetMode::Percent
+                                        {
+                                            draft.target_size_pct = active_idx
+                                                .map(|idx| {
+                                                    initial_target_pct_from_mb(
+                                                        draft.target_size_mb,
+                                                        self.files[idx].original_size_mb,
+                                                    )
+                                                })
+                                                .unwrap_or(100.0);
+                                        }
+                                    }
+                                },
+                            );
+
+                            match draft.target_mode {
+                                TargetMode::Off => {
+                                    ui.allocate_ui_with_layout(
+                                        egui::vec2(col1_w, row_h),
+                                        egui::Layout::left_to_right(egui::Align::Center),
+                                        |ui| {
+                                            self.render_estimated_size_inline(
+                                                ui,
+                                                active_idx,
+                                                &draft.options,
+                                            );
+                                        },
+                                    );
+                                }
+                                TargetMode::Megabytes => {
+                                    let target_decimals = if has_files {
+                                        target_decimals_for_mb(f64::from(max_target_mb))
+                                    } else {
+                                        2
+                                    };
+                                    draft.target_size_mb =
+                                        draft.target_size_mb.clamp(0.0, max_target_mb);
+                                    let prev_target = draft.target_size_mb;
+
+                                    ui.add_enabled_ui(has_files, |ui| {
+                                        ui.horizontal(|ui| {
+                                            ui.spacing_mut().slider_width = fixed_slider_width;
+                                            let slider_resp = ui.add(
+                                                egui::Slider::new(
+                                                    &mut draft.target_size_mb,
+                                                    0.0..=max_target_mb,
+                                                )
+                                                .show_value(false)
+                                                .clamping(egui::SliderClamping::Always),
+                                            );
+                                            let drag_resp = ui.add_sized(
+                                                [VALUE_BOX_W, row_h],
+                                                egui::DragValue::new(&mut draft.target_size_mb)
+                                                    .range(0.0..=max_target_mb)
+                                                    .speed(
+                                                        (f64::from(max_target_mb) / 200.0)
+                                                            .clamp(0.001, 0.25),
+                                                    )
+                                                    .fixed_decimals(target_decimals)
+                                                    .suffix(" MB"),
+                                            );
+                                            if (slider_resp.changed() || drag_resp.changed())
+                                                && (draft.target_size_mb - prev_target).abs()
+                                                    >= 1e-5
+                                            {
+                                                delta.target_mb_changed = true;
+                                            }
+                                        });
+                                    });
+                                }
+                                TargetMode::Percent => {
+                                    draft.target_size_pct =
+                                        draft.target_size_pct.clamp(1.0, 100.0);
+                                    let prev_pct = draft.target_size_pct;
+
+                                    ui.add_enabled_ui(has_files, |ui| {
+                                        ui.horizontal(|ui| {
+                                            ui.spacing_mut().slider_width = fixed_slider_width;
+                                            let slider_resp = ui.add(
+                                                egui::Slider::new(
+                                                    &mut draft.target_size_pct,
+                                                    1.0..=100.0,
+                                                )
+                                                .show_value(false)
+                                                .step_by(1.0)
+                                                .clamping(egui::SliderClamping::Always),
+                                            );
+                                            let drag_resp = ui.add_sized(
+                                                [VALUE_BOX_W, row_h],
+                                                egui::DragValue::new(&mut draft.target_size_pct)
+                                                    .range(1.0..=100.0)
+                                                    .speed(0.5)
+                                                    .fixed_decimals(0)
+                                                    .suffix("%"),
+                                            );
+                                            if (slider_resp.changed() || drag_resp.changed())
+                                                && (draft.target_size_pct - prev_pct).abs()
+                                                    >= 1e-4
+                                            {
+                                                delta.target_pct_changed = true;
+                                            }
+                                        });
+                                    });
+                                }
+                            }
+                            ui.end_row();
                         });
+
                     #[cfg(test)]
                     {
                         self.last_quality_slider_rect = captured_q_slider;
@@ -1386,129 +1864,6 @@ impl PdfCompressorApp {
                         self.last_scale_slider_rect = captured_s_slider;
                         self.last_scale_drag_rect = captured_s_drag;
                     }
-
-                    ui.add_space(8.0);
-
-                    // Resize filter choice
-                    let prev_filter = draft.options.resize_filter;
-                    ui.horizontal(|ui| {
-                        ui.label("Resize Filter:");
-                        for filter in ResizeFilterChoice::ALL {
-                            let selected = draft.options.resize_filter == filter;
-                            if ui.selectable_label(selected, filter.label()).clicked() {
-                                draft.options.resize_filter = filter;
-                            }
-                        }
-                    });
-                    if draft.options.resize_filter != prev_filter {
-                        delta.filter_changed = true;
-                    }
-
-                    ui.add_space(8.0);
-
-                    // Unified 3-state Target Size (Off -> MB -> %) / Estimated Size row
-                    ui.horizontal(|ui| {
-                        let prev_mode = draft.target_mode;
-                        let mut cb_checked = prev_mode.is_enabled();
-                        let cb_resp = ui.checkbox(&mut cb_checked, prev_mode.label());
-                        if cb_resp.changed() {
-                            let next_mode = prev_mode.next();
-                            draft.target_mode = next_mode;
-                            delta.target_mode_changed = true;
-                            delta.target_mode_activated = next_mode.is_enabled();
-                            if prev_mode == TargetMode::Megabytes
-                                && next_mode == TargetMode::Percent
-                            {
-                                draft.target_size_pct = active_idx
-                                    .map(|idx| {
-                                        initial_target_pct_from_mb(
-                                            draft.target_size_mb,
-                                            self.files[idx].original_size_mb,
-                                        )
-                                    })
-                                    .unwrap_or(100.0);
-                            }
-                        }
-
-                        match draft.target_mode {
-                            TargetMode::Off => {
-                                ui.add_space(6.0);
-                                self.render_estimated_size_inline(ui, active_idx, &draft.options);
-                            }
-                            TargetMode::Megabytes => {
-                                let target_decimals = if has_files {
-                                    target_decimals_for_mb(f64::from(max_target_mb))
-                                } else {
-                                    2
-                                };
-                                draft.target_size_mb =
-                                    draft.target_size_mb.clamp(0.0, max_target_mb);
-                                let prev_target = draft.target_size_mb;
-
-                                ui.add_enabled_ui(has_files, |ui| {
-                                    let slider_resp = ui.add(
-                                        egui::Slider::new(
-                                            &mut draft.target_size_mb,
-                                            0.0..=max_target_mb,
-                                        )
-                                        .show_value(false)
-                                        .clamping(egui::SliderClamping::Always),
-                                    );
-                                    let drag_resp = ui.add(
-                                        egui::DragValue::new(&mut draft.target_size_mb)
-                                            .range(0.0..=max_target_mb)
-                                            .speed(
-                                                (f64::from(max_target_mb) / 200.0)
-                                                    .clamp(0.001, 0.25),
-                                            )
-                                            .fixed_decimals(target_decimals)
-                                            .suffix(" MB"),
-                                    );
-                                    if (slider_resp.changed() || drag_resp.changed())
-                                        && (draft.target_size_mb - prev_target).abs() >= 1e-5
-                                    {
-                                        delta.target_mb_changed = true;
-                                    }
-                                });
-
-                                if has_files && draft.target_size_mb <= 0.0 {
-                                    ui.label(
-                                        RichText::new("(No limit)")
-                                            .size(12.0)
-                                            .color(ui.visuals().weak_text_color()),
-                                    );
-                                }
-                            }
-                            TargetMode::Percent => {
-                                draft.target_size_pct = draft.target_size_pct.clamp(1.0, 100.0);
-                                let prev_pct = draft.target_size_pct;
-
-                                ui.add_enabled_ui(has_files, |ui| {
-                                    let slider_resp = ui.add(
-                                        egui::Slider::new(
-                                            &mut draft.target_size_pct,
-                                            1.0..=100.0,
-                                        )
-                                        .show_value(false)
-                                        .step_by(1.0)
-                                        .clamping(egui::SliderClamping::Always),
-                                    );
-                                    let drag_resp = ui.add(
-                                        egui::DragValue::new(&mut draft.target_size_pct)
-                                            .range(1.0..=100.0)
-                                            .speed(0.5)
-                                            .fixed_decimals(0)
-                                            .suffix("%"),
-                                    );
-                                    if (slider_resp.changed() || drag_resp.changed())
-                                        && (draft.target_size_pct - prev_pct).abs() >= 1e-4
-                                    {
-                                        delta.target_pct_changed = true;
-                                    }
-                                });
-                            }
-                        }
-                    });
                 });
 
                 if delta.any_changed() {
@@ -1540,172 +1895,11 @@ impl PdfCompressorApp {
         );
     }
 
-    fn single_summary_metrics(&self) -> (String, String, String, bool) {
-        let Some(item) = self.files.first() else {
-            return ("-".to_string(), "-".to_string(), "-".to_string(), false);
-        };
-
-        match &item.result {
-            Some(result) => (
-                format_bytes(result.stats.original_bytes),
-                format_bytes(result.stats.compressed_bytes),
-                format_saved_pct(result.space_saved_pct),
-                false,
-            ),
-            None => {
-                let orig_bytes = item.summary.file_bytes;
-                let (saved_str, is_est) = match item.estimated_saved_percentage() {
-                    Some(saved_pct) => (format_estimated_saved_pct(saved_pct), true),
-                    None => ("-".to_string(), false),
-                };
-                (format_bytes(orig_bytes), "-".to_string(), saved_str, is_est)
-            }
-        }
-    }
-
-    fn render_summary_card(&self, ui: &mut egui::Ui) {
-        if self.is_multi_file() {
-            self.render_batch_summary_card(ui);
-        } else {
-            self.render_single_summary_card(ui);
-        }
-    }
-
-    fn render_single_summary_card(&self, ui: &mut egui::Ui) {
+    fn render_summary_card(&mut self, ui: &mut egui::Ui) -> f32 {
         let dark = ui.visuals().dark_mode;
-        let item = self.files.first();
-        let result = item.and_then(|f| f.result.as_ref());
-        let has_active_target = item
-            .and_then(|f| f.settings.effective_target_mb(f.original_size_mb))
-            .is_some_and(|mb| mb_to_bytes(mb) > 0);
-        let over_target = result.is_some_and(|r| r.over_target);
-
-        let (card_fill, border_color) = match result {
-            None => (neutral_card_fill(dark), neutral_card_border(dark)),
-            Some(_) if over_target => {
-                if dark {
-                    (Color32::from_rgb(48, 30, 30), Color32::from_rgb(200, 75, 75))
-                } else {
-                    (Color32::from_rgb(255, 243, 243), Color32::from_rgb(217, 83, 79))
-                }
-            }
-            Some(_) => {
-                if dark {
-                    (Color32::from_rgb(26, 44, 34), Color32::from_rgb(60, 160, 95))
-                } else {
-                    (Color32::from_rgb(240, 252, 244), Color32::from_rgb(52, 168, 83))
-                }
-            }
-        };
-
-        Frame::new()
-            .fill(card_fill)
-            .stroke(Stroke::new(1.0, border_color))
-            .corner_radius(CornerRadius::same(10))
-            .inner_margin(Margin::same(14))
-            .show(ui, |ui| {
-                ui.set_width(ui.available_width());
-                ui.horizontal(|ui| {
-                    ui.label(RichText::new("Compression Summary").strong().size(15.0));
-                    if self.is_busy() {
-                        self.render_summary_header_progress(ui);
-                    } else if result.is_some() {
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            let (badge_text, badge_fill) = if over_target {
-                                ("OVER TARGET", Color32::from_rgb(198, 40, 40))
-                            } else if has_active_target {
-                                ("UNDER TARGET", Color32::from_rgb(34, 139, 72))
-                            } else {
-                                ("COMPRESSED", Color32::from_rgb(34, 139, 72))
-                            };
-
-                            Frame::new()
-                                .fill(badge_fill)
-                                .corner_radius(CornerRadius::same(6))
-                                .inner_margin(Margin::symmetric(8, 4))
-                                .show(ui, |ui| {
-                                    ui.label(
-                                        RichText::new(badge_text)
-                                            .strong()
-                                            .size(12.0)
-                                            .color(Color32::WHITE),
-                                    );
-                                });
-                        });
-                    }
-                });
-
-                ui.add_space(8.0);
-
-                let (orig_text, new_text, saved_text, saved_is_estimate) =
-                    self.single_summary_metrics();
-
-                egui::Grid::new("summary_metrics_grid")
-                    .num_columns(3)
-                    .min_col_width(110.0)
-                    .spacing([28.0, 4.0])
-                    .show(ui, |ui| {
-                        ui.label(
-                            RichText::new("Original Size")
-                                .size(12.0)
-                                .color(ui.visuals().weak_text_color()),
-                        );
-                        ui.label(
-                            RichText::new("New Size")
-                                .size(12.0)
-                                .color(ui.visuals().weak_text_color()),
-                        );
-                        ui.label(
-                            RichText::new("Space Saved")
-                                .size(12.0)
-                                .color(ui.visuals().weak_text_color()),
-                        );
-                        ui.end_row();
-
-                        ui.label(RichText::new(orig_text).strong().size(16.0));
-                        ui.label(RichText::new(new_text).strong().size(16.0));
-                        let saved_rich = if saved_is_estimate {
-                            RichText::new(saved_text)
-                                .size(16.0)
-                                .color(ui.visuals().weak_text_color())
-                        } else {
-                            RichText::new(saved_text).strong().size(16.0)
-                        };
-                        ui.label(saved_rich);
-                        ui.end_row();
-                    });
-
-                if let Some(res) = result {
-                    ui.add_space(8.0);
-                    ui.label(
-                        RichText::new(format!("Saved to: {}", res.saved_path.display()))
-                            .size(11.5)
-                            .color(ui.visuals().weak_text_color()),
-                    );
-                }
-            });
-    }
-
-    fn render_summary_header_progress(&self, ui: &mut egui::Ui) {
-        let Some(p) = &self.progress else {
-            return;
-        };
-        let total = p.total.max(1);
-        let current = p.current.min(total);
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            ui.spacing_mut().item_spacing.x = 6.0;
-            ui.label(
-                RichText::new(format!("{current}/{total}"))
-                    .size(12.5)
-                    .strong()
-                    .color(ui.visuals().strong_text_color()),
-            );
-            ui.add(egui::Spinner::new().size(14.0));
-        });
-    }
-
-    fn render_batch_summary_card(&self, ui: &mut egui::Ui) {
-        let dark = ui.visuals().dark_mode;
+        let busy = self.is_busy();
+        let mut clear_clicked = false;
+        let mut extra_summary_h = 0.0_f32;
         Frame::new()
             .fill(neutral_card_fill(dark))
             .stroke(Stroke::new(1.0, neutral_card_border(dark)))
@@ -1715,8 +1909,21 @@ impl PdfCompressorApp {
                 ui.set_width(ui.available_width());
                 ui.horizontal(|ui| {
                     ui.label(RichText::new("Compression Summary").strong().size(15.0));
-                    if self.is_busy() {
+                    if busy {
                         self.render_summary_header_progress(ui);
+                    } else if !self.files.is_empty() {
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if ui
+                                .add(
+                                    egui::Button::new(RichText::new("Clear").size(11.5))
+                                        .min_size(egui::vec2(44.0, 18.0)),
+                                )
+                                .on_hover_text("Clear loaded PDFs and free preview memory")
+                                .clicked()
+                            {
+                                clear_clicked = true;
+                            }
+                        });
                     }
                 });
                 ui.add_space(8.0);
@@ -1739,15 +1946,28 @@ impl PdfCompressorApp {
                 );
                 ui.add_space(3.0);
 
-                let max_scroll_h = (SUMMARY_TABLE_MAX_VISIBLE_ROWS as f32) * TABLE_ROW_HEIGHT
-                    + ((SUMMARY_TABLE_MAX_VISIBLE_ROWS - 1) as f32) * TABLE_ROW_GAP;
+                let file_count = self.files.len();
+                let (scroll_h, auto_shrink_y) = if file_count < SUMMARY_TABLE_MIN_VISIBLE_ROWS {
+                    (summary_rows_height(file_count), true)
+                } else {
+                    let min_scroll_h = summary_rows_height(SUMMARY_TABLE_MIN_VISIBLE_ROWS);
+                    let max_rows = file_count.min(SUMMARY_TABLE_MAX_VISIBLE_ROWS);
+                    let max_scroll_h = summary_rows_height(max_rows);
+                    let remaining_for_rows = (ui.clip_rect().max.y - ui.cursor().top() - 16.0).max(0.0);
+                    let target_h = remaining_for_rows.clamp(min_scroll_h, max_scroll_h);
+                    extra_summary_h = (target_h - min_scroll_h).max(0.0);
+                    (target_h, false)
+                };
                 let guide_stroke = Stroke::new(1.0, table_row_guide_color(dark));
 
-                egui::ScrollArea::vertical()
+                let mut scroll_area = egui::ScrollArea::vertical()
                     .id_salt("batch_summary_scroll")
-                    .max_height(max_scroll_h)
-                    .auto_shrink([false, true])
-                    .show(ui, |ui| {
+                    .max_height(scroll_h)
+                    .auto_shrink([false, auto_shrink_y]);
+                if !auto_shrink_y {
+                    scroll_area = scroll_area.min_scrolled_height(scroll_h);
+                }
+                scroll_area.show(ui, |ui| {
                         ui.spacing_mut().item_spacing.y = TABLE_ROW_GAP;
                         let row_w = total_w.min(ui.available_width());
                         let widths = summary_table_col_widths(row_w);
@@ -1814,7 +2034,16 @@ impl PdfCompressorApp {
                         }
                     });
 
-                if let Some(folder) = &self.batch_saved_folder {
+                if self.files.len() == 1 {
+                    if let Some(res) = self.files.first().and_then(|f| f.result.as_ref()) {
+                        ui.add_space(8.0);
+                        ui.label(
+                            RichText::new(format!("Saved to: {}", res.saved_path.display()))
+                                .size(11.5)
+                                .color(ui.visuals().weak_text_color()),
+                        );
+                    }
+                } else if let Some(folder) = &self.batch_saved_folder {
                     ui.add_space(8.0);
                     ui.label(
                         RichText::new(format!("Saved to: {}", folder.display()))
@@ -1823,12 +2052,899 @@ impl PdfCompressorApp {
                     );
                 }
             });
+
+        if clear_clicked {
+            self.clear_files();
+        }
+        extra_summary_h
+    }
+
+    fn render_summary_header_progress(&self, ui: &mut egui::Ui) {
+        let Some(p) = &self.progress else {
+            return;
+        };
+        let total = p.total.max(1);
+        let current = p.current.min(total);
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            ui.spacing_mut().item_spacing.x = 6.0;
+            ui.label(
+                RichText::new(format!("{current}/{total}"))
+                    .size(12.5)
+                    .strong()
+                    .color(ui.visuals().strong_text_color()),
+            );
+            ui.add(egui::Spinner::new().size(14.0));
+        });
+    }
+
+    fn sync_preview_selection_and_poll(&mut self, ctx: &egui::Context) {
+        let Some(active_idx) = (if self.show_preview {
+            self.active_index()
+        } else {
+            None
+        }) else {
+            if self.preview_display.is_some()
+                || self.preview_pending_key.is_some()
+                || self.preview_inflight_key.is_some()
+                || self.preview_rx.is_some()
+            {
+                self.clear_preview_textures();
+            }
+            return;
+        };
+
+        let total_pages = self.files[active_idx].summary.page_count.max(1);
+        self.preview_page = self.preview_page.clamp(1, total_pages);
+        let desired_key =
+            PreviewKey::from_item(active_idx, &self.files[active_idx], self.preview_page);
+
+        // Immediately drop old page/file textures when switching pages or active files.
+        if self
+            .preview_display
+            .as_ref()
+            .is_some_and(|d| !d.key.same_source_page(&desired_key))
+        {
+            self.preview_display = None;
+            self.preview_show_original_held = false;
+            self.preview_scroll_offset = egui::Vec2::ZERO;
+        }
+
+        // Poll completed background preview jobs and upload single-page RGBA textures.
+        let current_gen = self.preview_generation.load(Ordering::Relaxed);
+        let mut completed: Vec<PreviewWorkerEvent> = Vec::new();
+        if let Some(rx) = &self.preview_rx {
+            while let Ok(ev) = rx.try_recv() {
+                completed.push(ev);
+            }
+        }
+        for ev in completed {
+            if self.preview_inflight_key.as_ref() == Some(&ev.key) {
+                self.preview_inflight_key = None;
+            }
+            if ev.generation != current_gen || !ev.key.same_source_page(&desired_key) {
+                continue;
+            }
+            // Release previous TextureHandles before allocating the next page's textures,
+            // while preserving the existing Original texture handle for same-page slider ticks.
+            let prev_same_page_orig_tex = self.preview_display.take().and_then(|d| {
+                if d.key.same_source_page(&ev.key) {
+                    d.orig_texture
+                } else {
+                    None
+                }
+            });
+            const MAX_SAFE_GL_TEX_DIM: u32 = 4096;
+            let mut missing_reused_orig = false;
+            let display = match ev.outcome {
+                Ok(None) => PreviewDisplay {
+                    key: ev.key,
+                    orig_texture: None,
+                    orig_width: 0,
+                    orig_height: 0,
+                    comp_texture: None,
+                    comp_width: 0,
+                    comp_height: 0,
+                    kept_original: false,
+                    synthetic_empty: true,
+                    error: None,
+                },
+                Ok(Some(page_data)) => {
+                    let PagePreviewData {
+                        orig_width,
+                        orig_height,
+                        orig_stream_bytes: _,
+                        orig_rgba,
+                        comp_width,
+                        comp_height,
+                        comp_stream_bytes: _,
+                        comp_rgba,
+                        kept_original,
+                    } = *page_data;
+                    let expected_orig_len =
+                        (orig_width as usize).saturating_mul(orig_height as usize).saturating_mul(4);
+                    let orig_rgba_was_empty = orig_rgba.is_empty();
+                    let orig_texture = if orig_width > 0
+                        && orig_height > 0
+                        && orig_width <= MAX_SAFE_GL_TEX_DIM
+                        && orig_height <= MAX_SAFE_GL_TEX_DIM
+                        && orig_rgba.len() == expected_orig_len
+                    {
+                        let orig_img = egui::ColorImage::from_rgba_unmultiplied(
+                            [orig_width as usize, orig_height as usize],
+                            &orig_rgba,
+                        );
+                        drop(orig_rgba);
+                        Some(ctx.load_texture(
+                            "pdf_preview_original",
+                            orig_img,
+                            egui::TextureOptions::LINEAR,
+                        ))
+                    } else if orig_rgba_was_empty {
+                        prev_same_page_orig_tex
+                    } else {
+                        None
+                    };
+                    if orig_rgba_was_empty && orig_texture.is_none() {
+                        missing_reused_orig = true;
+                    }
+                    let comp_texture = if let Some(comp_rgba) = comp_rgba {
+                        let expected_comp_len = (comp_width as usize)
+                            .saturating_mul(comp_height as usize)
+                            .saturating_mul(4);
+                        if comp_width > 0
+                            && comp_height > 0
+                            && comp_width <= MAX_SAFE_GL_TEX_DIM
+                            && comp_height <= MAX_SAFE_GL_TEX_DIM
+                            && comp_rgba.len() == expected_comp_len
+                        {
+                            let comp_img = egui::ColorImage::from_rgba_unmultiplied(
+                                [comp_width as usize, comp_height as usize],
+                                &comp_rgba,
+                            );
+                            drop(comp_rgba);
+                            Some(ctx.load_texture(
+                                "pdf_preview_compressed",
+                                comp_img,
+                                egui::TextureOptions::LINEAR,
+                            ))
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    };
+                    PreviewDisplay {
+                        key: ev.key,
+                        orig_texture,
+                        orig_width,
+                        orig_height,
+                        comp_texture,
+                        comp_width,
+                        comp_height,
+                        kept_original,
+                        synthetic_empty: false,
+                        error: None,
+                    }
+                }
+                Err(err) => PreviewDisplay {
+                    key: ev.key,
+                    orig_texture: None,
+                    orig_width: 0,
+                    orig_height: 0,
+                    comp_texture: None,
+                    comp_width: 0,
+                    comp_height: 0,
+                    kept_original: false,
+                    synthetic_empty: false,
+                    error: Some(err),
+                },
+            };
+            if missing_reused_orig {
+                if let Some(tx) = &self.preview_cmd_tx {
+                    let _ = tx.send(PreviewCommand::ClearCache);
+                }
+            } else {
+                self.preview_display = Some(Box::new(display));
+            }
+        }
+
+        // Synthetic test items have neither a file path nor raw bytes; avoid spawning error workers.
+        let item = &self.files[active_idx];
+        if item.path.is_none() && item.in_memory_bytes.is_none() {
+            if self.preview_display.as_ref().is_none_or(|d| d.key != desired_key) {
+                self.preview_display = Some(Box::new(PreviewDisplay {
+                    key: desired_key,
+                    orig_texture: None,
+                    orig_width: 0,
+                    orig_height: 0,
+                    comp_texture: None,
+                    comp_width: 0,
+                    comp_height: 0,
+                    kept_original: false,
+                    synthetic_empty: true,
+                    error: None,
+                }));
+            }
+            return;
+        }
+
+        let up_to_date = self
+            .preview_display
+            .as_ref()
+            .is_some_and(|d| d.key == desired_key)
+            || self.preview_inflight_key.as_ref() == Some(&desired_key);
+        if up_to_date {
+            self.preview_pending_key = None;
+            self.preview_pending_since = None;
+            if self.preview_inflight_key.is_some() {
+                ctx.request_repaint_after(Duration::from_millis(30));
+            }
+            return;
+        }
+
+        // Pause launching new preview renders while PDF loading or compression is actively running
+        // so background workers never compete for CPU/RAM on low-end hardware.
+        if self.is_busy() {
+            return;
+        }
+
+        // Debounce ~120 ms for slider/setting changes; dispatch immediately on page/file switch.
+        let same_page_displayed = self
+            .preview_display
+            .as_ref()
+            .is_some_and(|d| d.key.same_source_page(&desired_key))
+            || self
+                .preview_inflight_key
+                .as_ref()
+                .is_some_and(|k| k.same_source_page(&desired_key));
+
+        if self.preview_pending_key.as_ref() != Some(&desired_key) {
+            self.preview_pending_key = Some(desired_key.clone());
+            self.preview_pending_since = Some(Instant::now());
+        }
+
+        let elapsed = self
+            .preview_pending_since
+            .map_or(Duration::ZERO, |t| t.elapsed());
+        let debounce = if same_page_displayed {
+            Duration::from_millis(PREVIEW_DEBOUNCE_MS)
+        } else {
+            Duration::ZERO
+        };
+
+        if elapsed >= debounce {
+            self.preview_pending_key = None;
+            self.preview_pending_since = None;
+            self.spawn_preview_worker(active_idx, desired_key, ctx);
+        } else {
+            let remaining = debounce.saturating_sub(elapsed).max(Duration::from_millis(16));
+            ctx.request_repaint_after(remaining);
+        }
+    }
+
+    fn ensure_preview_worker(&mut self) {
+        if self.preview_cmd_tx.is_some() {
+            return;
+        }
+        let (cmd_tx, cmd_rx) = mpsc::channel::<PreviewCommand>();
+        let (ev_tx, ev_rx) = mpsc::channel::<PreviewWorkerEvent>();
+        let gen_counter = Arc::clone(&self.preview_generation);
+        self.preview_cmd_tx = Some(cmd_tx);
+        self.preview_rx = Some(ev_rx);
+
+        let spawn_worker = move || {
+            set_current_thread_below_normal();
+            let mut cache = PreviewSessionCache::default();
+            while let Ok(mut cmd) = cmd_rx.recv() {
+                // Coalesce bursty slider ticks / page changes to only the newest pending command.
+                while let Ok(newer) = cmd_rx.try_recv() {
+                    cmd = newer;
+                }
+                match cmd {
+                    PreviewCommand::ClearCache => {
+                        cache.clear();
+                    }
+                    PreviewCommand::Render(req) => {
+                        let PreviewRenderRequest {
+                            generation,
+                            key,
+                            path,
+                            in_memory_bytes,
+                            options,
+                            reply_ctx,
+                        } = *req;
+                        let is_cancelled = || gen_counter.load(Ordering::Relaxed) != generation;
+                        if is_cancelled() {
+                            continue;
+                        }
+                        let page_number = key.page_number;
+                        let source_id = key.source_id;
+                        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            if let Some(ref path) = path {
+                                render_page_preview_cached(
+                                    &mut cache,
+                                    source_id,
+                                    PreviewSource::Path(path.as_path()),
+                                    page_number,
+                                    &options,
+                                    &is_cancelled,
+                                )
+                                .map(|data| Some(Box::new(data)))
+                                .map_err(|e| e.to_string())
+                            } else if let Some(bytes) = in_memory_bytes {
+                                render_page_preview_cached(
+                                    &mut cache,
+                                    source_id,
+                                    PreviewSource::SharedBytes(bytes),
+                                    page_number,
+                                    &options,
+                                    &is_cancelled,
+                                )
+                                .map(|data| Some(Box::new(data)))
+                                .map_err(|e| e.to_string())
+                            } else {
+                                Ok(None)
+                            }
+                        }))
+                        .unwrap_or_else(|_| {
+                            cache.clear();
+                            Err("Preview unavailable for this page".to_string())
+                        });
+
+                        let _ = ev_tx.send(PreviewWorkerEvent {
+                            generation,
+                            key,
+                            outcome,
+                        });
+                        reply_ctx.request_repaint();
+                    }
+                }
+            }
+        };
+        if !spawn_worker_thread("pdf_preview_worker", spawn_worker) {
+            self.preview_cmd_tx = None;
+            self.preview_rx = None;
+        }
+    }
+
+    fn spawn_preview_worker(
+        &mut self,
+        active_idx: usize,
+        key: PreviewKey,
+        ctx: &egui::Context,
+    ) {
+        let Some((path, in_memory_bytes, options)) = self.files.get(active_idx).map(|item| {
+            (
+                item.path.clone(),
+                item.in_memory_bytes.clone(),
+                item.settings.options.clone(),
+            )
+        }) else {
+            return;
+        };
+
+        self.ensure_preview_worker();
+        let gen = self.preview_generation.fetch_add(1, Ordering::Relaxed) + 1;
+        self.preview_inflight_key = Some(key.clone());
+
+        if let Some(tx) = &self.preview_cmd_tx {
+            let _ = tx.send(PreviewCommand::Render(Box::new(PreviewRenderRequest {
+                generation: gen,
+                key,
+                path,
+                in_memory_bytes,
+                options,
+                reply_ctx: ctx.clone(),
+            })));
+        }
+    }
+
+    fn active_preview_view_mode(&self) -> PreviewViewMode {
+        if self.preview_fixed_zoom {
+            PreviewViewMode::FixedZoomPct(self.preview_zoom_pct.clamp(10, 500))
+        } else {
+            PreviewViewMode::Framing(self.preview_framing)
+        }
+    }
+
+    fn commit_preview_zoom_edit(&mut self) {
+        let cleaned = self.preview_zoom_edit_buf.trim().trim_end_matches('%').trim();
+        if let Ok(val) = cleaned.parse::<f32>() {
+            if val.is_finite() {
+                self.preview_zoom_exact = val.clamp(10.0, 500.0);
+                self.preview_zoom_pct = self.preview_zoom_exact.round().clamp(10.0, 500.0) as u16;
+                self.preview_fixed_zoom = true;
+            }
+        }
+        self.preview_zoom_editing = false;
+        self.preview_zoom_just_started = false;
+    }
+
+    fn commit_preview_page_edit(&mut self, total_pages: usize) {
+        let trimmed = self.preview_page_edit_buf.trim();
+        if let Ok(val) = trimmed.parse::<usize>() {
+            self.preview_page = val.clamp(1, total_pages.max(1));
+        }
+        self.preview_page_edit_buf = self.preview_page.to_string();
+    }
+
+    fn render_preview_panel(&mut self, ui: &mut egui::Ui) {
+        let Some(active_idx) = self.active_index() else {
+            return;
+        };
+        let total_pages = self.files[active_idx].summary.page_count.max(1);
+        self.preview_page = self.preview_page.clamp(1, total_pages);
+        let busy_preview =
+            self.preview_inflight_key.is_some() || self.preview_pending_key.is_some();
+        let dark = ui.visuals().dark_mode;
+
+        // Header bar: 3 responsive zones — left title, dynamically centered page selector, right [100%] [Fit] [Original].
+        const TOOLBAR_H: f32 = 24.0;
+        const GAP_X: f32 = 6.0;
+        const FRAMING_W: f32 = 48.0;
+        const ZOOM_W: f32 = 58.0;
+        const ORIG_W: f32 = 62.0;
+
+        let avail_w = ui.available_width().max(120.0);
+        let (header_rect, _) =
+            ui.allocate_exact_size(egui::vec2(avail_w, TOOLBAR_H), egui::Sense::hover());
+
+        // 1. Left Zone: "Page Preview" + optional spinner.
+        let left_resp = ui.scope_builder(
+            egui::UiBuilder::new()
+                .max_rect(header_rect)
+                .layout(egui::Layout::left_to_right(egui::Align::Center)),
+            |ui| {
+                ui.spacing_mut().item_spacing.x = GAP_X;
+                ui.label(RichText::new("Page Preview").strong().size(15.0));
+                if busy_preview {
+                    ui.add(egui::Spinner::new().size(13.0));
+                }
+            },
+        );
+        let left_end_x = left_resp.response.rect.max.x;
+
+        // 3. Right Zone geometry: right-to-left anchored at header_rect.max.x so zoom textbox expands left without moving Fit/Original.
+        let right_reserve_w = ZOOM_W + FRAMING_W + ORIG_W + 2.0 * GAP_X;
+        let right_start_x = (header_rect.max.x - right_reserve_w).max(header_rect.min.x);
+        let right_rect = egui::Rect::from_min_max(
+            egui::pos2(left_end_x + GAP_X, header_rect.min.y),
+            egui::pos2(header_rect.max.x, header_rect.min.y + TOOLBAR_H),
+        );
+
+        // 2. Center Zone geometry: < [ 1 / X ] > centered in the preview panel, clamped away from left/right zones.
+        let total_str = total_pages.to_string();
+        let digits_w = (total_str.len() as f32 * 7.5).max(12.0);
+        let pill_w = 18.0 + digits_w * 2.0 + 16.0;
+        let center_w = TOOLBAR_H + pill_w + TOOLBAR_H + 2.0 * GAP_X;
+        let ideal_center_x = header_rect.center().x - center_w * 0.5;
+        let min_center_x = left_end_x + GAP_X;
+        let max_center_x = (right_start_x - GAP_X - center_w).max(min_center_x);
+        let center_x = ideal_center_x.clamp(min_center_x, max_center_x);
+        let center_avail_w = (right_start_x - GAP_X - center_x).max(0.0).min(center_w);
+        if center_avail_w >= 40.0 {
+            let center_rect = egui::Rect::from_min_size(
+                egui::pos2(center_x, header_rect.min.y),
+                egui::vec2(center_avail_w, TOOLBAR_H),
+            );
+            ui.scope_builder(
+                egui::UiBuilder::new()
+                    .max_rect(center_rect)
+                    .layout(egui::Layout::left_to_right(egui::Align::Center)),
+                |ui| {
+                    ui.spacing_mut().item_spacing.x = GAP_X;
+                    ui.spacing_mut().interact_size.y = TOOLBAR_H;
+
+                    if ui
+                        .add_enabled(
+                            self.preview_page > 1 && total_pages > 1,
+                            egui::Button::new("<")
+                                .min_size(egui::vec2(TOOLBAR_H, TOOLBAR_H))
+                                .corner_radius(CornerRadius::same(8)),
+                        )
+                        .on_hover_text("Previous page")
+                        .clicked()
+                    {
+                        self.preview_page = self.preview_page.saturating_sub(1).max(1);
+                        self.preview_page_edit_buf = self.preview_page.to_string();
+                    }
+
+                    let pill_fill = if dark {
+                        Color32::from_rgb(38, 43, 52)
+                    } else {
+                        Color32::from_rgb(236, 240, 246)
+                    };
+                    Frame::new()
+                        .fill(pill_fill)
+                        .stroke(Stroke::new(1.0, neutral_card_border(dark)))
+                        .corner_radius(CornerRadius::same(12))
+                        .inner_margin(Margin::symmetric(9, 0))
+                        .show(ui, |ui| {
+                            ui.set_height(TOOLBAR_H - 2.0);
+                            ui.with_layout(
+                                egui::Layout::left_to_right(egui::Align::Center),
+                                |ui| {
+                                    ui.spacing_mut().item_spacing.x = 3.0;
+                                    let page_edit_id =
+                                        ui.make_persistent_id("preview_page_jump_edit");
+                                    if !ui.ctx().memory(|m| m.has_focus(page_edit_id)) {
+                                        let current_text = self.preview_page.to_string();
+                                        if self.preview_page_edit_buf != current_text {
+                                            self.preview_page_edit_buf = current_text;
+                                        }
+                                    }
+                                    let edit_resp = ui.add(
+                                        egui::TextEdit::singleline(
+                                            &mut self.preview_page_edit_buf,
+                                        )
+                                        .id(page_edit_id)
+                                        .frame(Frame::NONE)
+                                        .margin(Margin::ZERO)
+                                        .background_color(Color32::TRANSPARENT)
+                                        .font(egui::FontId::proportional(12.0))
+                                        .align(egui::Align2::CENTER_CENTER)
+                                        .desired_width(digits_w)
+                                        .interactive(total_pages > 1),
+                                    );
+                                    if edit_resp.has_focus()
+                                        && ui.input(|i| i.key_pressed(egui::Key::Escape))
+                                    {
+                                        self.preview_page_edit_buf =
+                                            self.preview_page.to_string();
+                                        edit_resp.surrender_focus();
+                                    } else if edit_resp.lost_focus()
+                                        || (edit_resp.has_focus()
+                                            && ui.input(|i| i.key_pressed(egui::Key::Enter)))
+                                    {
+                                        self.commit_preview_page_edit(total_pages);
+                                    }
+                                    ui.label(
+                                        RichText::new("/")
+                                            .size(12.0)
+                                            .color(ui.visuals().weak_text_color()),
+                                    );
+                                    ui.label(
+                                        RichText::new(&total_str)
+                                            .size(12.0)
+                                            .color(ui.visuals().weak_text_color()),
+                                    );
+                                },
+                            );
+                        });
+
+                    if ui
+                        .add_enabled(
+                            self.preview_page < total_pages,
+                            egui::Button::new(">")
+                                .min_size(egui::vec2(TOOLBAR_H, TOOLBAR_H))
+                                .corner_radius(CornerRadius::same(8)),
+                        )
+                        .on_hover_text("Next page")
+                        .clicked()
+                    {
+                        self.preview_page = (self.preview_page + 1).min(total_pages);
+                        self.preview_page_edit_buf = self.preview_page.to_string();
+                    }
+                },
+            );
+        }
+
+        // Render Right Zone anchored on right edge (right-to-left): [Original] <- [Fit] <- [100%/edit]
+        ui.scope_builder(
+            egui::UiBuilder::new()
+                .max_rect(right_rect)
+                .layout(egui::Layout::right_to_left(egui::Align::Center)),
+            |ui| {
+                ui.spacing_mut().item_spacing.x = GAP_X;
+                ui.spacing_mut().interact_size.y = TOOLBAR_H;
+
+                let has_orig = self
+                    .preview_display
+                    .as_ref()
+                    .is_some_and(|d| d.orig_texture.is_some());
+                let prev_held = self.preview_show_original_held && has_orig;
+                let accent_fill = ui.visuals().selection.bg_fill;
+                let accent_stroke = ui.visuals().selection.stroke;
+                let mut orig_btn = egui::Button::new(
+                    RichText::new("Original").color(if prev_held {
+                        accent_stroke.color
+                    } else {
+                        ui.visuals().text_color()
+                    }),
+                )
+                .min_size(egui::vec2(ORIG_W, TOOLBAR_H))
+                .sense(egui::Sense::click_and_drag());
+                if prev_held {
+                    orig_btn = orig_btn.fill(accent_fill).stroke(accent_stroke);
+                }
+                let orig_resp = ui
+                    .add_enabled(has_orig, orig_btn)
+                    .on_hover_text("Hold to preview the uncompressed original page");
+                let held_now = has_orig
+                    && orig_resp.is_pointer_button_down_on()
+                    && ui.input(|i| i.pointer.primary_down());
+                if held_now != self.preview_show_original_held {
+                    self.preview_show_original_held = held_now;
+                    ui.ctx().request_repaint();
+                }
+
+                if ui
+                    .add_sized(
+                        [FRAMING_W, TOOLBAR_H],
+                        egui::Button::selectable(
+                            !self.preview_fixed_zoom,
+                            self.preview_framing.label(),
+                        ),
+                    )
+                    .on_hover_text(self.preview_framing.tooltip())
+                    .clicked()
+                {
+                    if self.preview_fixed_zoom {
+                        self.preview_fixed_zoom = false;
+                        self.preview_zoom_editing = false;
+                    } else {
+                        self.preview_framing = self.preview_framing.next();
+                    }
+                }
+
+                const ZOOM_H: f32 = 22.0;
+                let (pill_rect, pill_resp) =
+                    ui.allocate_exact_size(egui::vec2(ZOOM_W, ZOOM_H), egui::Sense::click());
+
+                let (pill_fill, pill_stroke) = if self.preview_zoom_editing {
+                    (
+                        if dark {
+                            Color32::from_rgb(38, 43, 52)
+                        } else {
+                            Color32::from_rgb(236, 240, 246)
+                        },
+                        Stroke::new(1.0, ui.visuals().selection.stroke.color),
+                    )
+                } else if self.preview_fixed_zoom {
+                    (
+                        ui.visuals().selection.bg_fill,
+                        ui.visuals().selection.stroke,
+                    )
+                } else if pill_resp.hovered() {
+                    (
+                        ui.visuals().widgets.hovered.bg_fill,
+                        ui.visuals().widgets.hovered.bg_stroke,
+                    )
+                } else {
+                    (
+                        if dark {
+                            Color32::from_rgb(38, 43, 52)
+                        } else {
+                            Color32::from_rgb(236, 240, 246)
+                        },
+                        Stroke::new(1.0, neutral_card_border(dark)),
+                    )
+                };
+
+                ui.painter().rect(
+                    pill_rect,
+                    CornerRadius::same(4),
+                    pill_fill,
+                    pill_stroke,
+                    egui::StrokeKind::Inside,
+                );
+
+                if self.preview_zoom_editing {
+                    let inner_rect = pill_rect.shrink2(egui::vec2(6.0, 2.0));
+                    ui.scope_builder(
+                        egui::UiBuilder::new()
+                            .max_rect(inner_rect)
+                            .layout(egui::Layout::left_to_right(egui::Align::Center)),
+                        |ui| {
+                            ui.set_clip_rect(inner_rect);
+                            ui.spacing_mut().item_spacing.x = 1.0;
+                            ui.spacing_mut().interact_size.y = inner_rect.height();
+                            let edit_resp = ui.add(
+                                egui::TextEdit::singleline(&mut self.preview_zoom_edit_buf)
+                                    .frame(Frame::NONE)
+                                    .margin(Margin::ZERO)
+                                    .background_color(Color32::TRANSPARENT)
+                                    .font(egui::FontId::proportional(12.0))
+                                    .align(egui::Align2::RIGHT_CENTER)
+                                    .desired_width(32.0)
+                                    .hint_text("100"),
+                            );
+                            ui.label(
+                                RichText::new("%")
+                                    .size(12.0)
+                                    .color(ui.visuals().weak_text_color()),
+                            );
+                            if self.preview_zoom_just_started {
+                                edit_resp.request_focus();
+                                self.preview_zoom_just_started = false;
+                            } else if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+                                self.preview_zoom_editing = false;
+                            } else if edit_resp.lost_focus()
+                                || (edit_resp.has_focus()
+                                    && ui.input(|i| i.key_pressed(egui::Key::Enter)))
+                            {
+                                self.commit_preview_zoom_edit();
+                            }
+                        },
+                    );
+                } else {
+                    let zoom_label = if self.preview_fixed_zoom {
+                        format!("{}%", self.preview_zoom_pct)
+                    } else {
+                        "100%".to_string()
+                    };
+                    let zoom_hint = if self.preview_fixed_zoom {
+                        "Fixed zoom active — click again to type a custom percentage (10%–500%)"
+                    } else {
+                        "Switch to fixed 100% (1.0×) zoom"
+                    };
+                    let text_color = if self.preview_fixed_zoom {
+                        ui.visuals().selection.stroke.color
+                    } else if pill_resp.hovered() {
+                        ui.visuals().widgets.hovered.fg_stroke.color
+                    } else {
+                        ui.visuals().text_color()
+                    };
+                    ui.painter().text(
+                        pill_rect.center(),
+                        egui::Align2::CENTER_CENTER,
+                        zoom_label,
+                        egui::FontId::proportional(12.0),
+                        text_color,
+                    );
+                    if pill_resp.on_hover_text(zoom_hint).clicked() {
+                        if !self.preview_fixed_zoom {
+                            self.preview_fixed_zoom = true;
+                            self.preview_zoom_pct = 100;
+                            self.preview_zoom_exact = 100.0;
+                        } else {
+                            self.preview_zoom_editing = true;
+                            self.preview_zoom_just_started = true;
+                            self.preview_zoom_edit_buf = self.preview_zoom_pct.to_string();
+                        }
+                    }
+                }
+            },
+        );
+
+        ui.add_space(8.0);
+
+        let card_fill = neutral_card_fill(dark);
+        let border_color = neutral_card_border(dark);
+        let weak_color = ui.visuals().weak_text_color();
+
+        let Some(display) = &self.preview_display else {
+            Self::render_preview_placeholder(
+                ui,
+                card_fill,
+                border_color,
+                weak_color,
+                if busy_preview {
+                    "Rendering page preview..."
+                } else {
+                    "Preparing preview..."
+                },
+                busy_preview,
+            );
+            return;
+        };
+
+        if let Some(_err) = &display.error {
+            Self::render_preview_placeholder(
+                ui,
+                card_fill,
+                border_color,
+                Color32::from_rgb(200, 75, 75),
+                "Preview unavailable for this page",
+                false,
+            );
+            return;
+        }
+
+        if display.synthetic_empty {
+            Self::render_preview_placeholder(
+                ui,
+                card_fill,
+                border_color,
+                weak_color,
+                "Preview unavailable (no PDF data loaded)",
+                false,
+            );
+            return;
+        }
+
+        let orig_tex = display
+            .orig_texture
+            .as_ref()
+            .map(|t| (t.id(), display.orig_width, display.orig_height));
+        let comp_tex = display
+            .comp_texture
+            .as_ref()
+            .or({
+                if display.kept_original
+                    || (display.comp_width == display.orig_width
+                        && display.comp_height == display.orig_height)
+                {
+                    display.orig_texture.as_ref()
+                } else {
+                    None
+                }
+            })
+            .map(|t| (t.id(), display.comp_width, display.comp_height));
+
+        let active_tex = if self.preview_show_original_held {
+            orig_tex.or(comp_tex)
+        } else {
+            comp_tex.or(orig_tex)
+        };
+
+        let view_mode = self.active_preview_view_mode();
+        let pane_height = ui.available_height().max(220.0);
+        let pane_width = ui.available_width().max(120.0);
+
+        let mut zoomed_pct = None;
+        ui.allocate_ui_with_layout(
+            egui::vec2(pane_width, pane_height),
+            egui::Layout::top_down(egui::Align::Min),
+            |ui| {
+                zoomed_pct = render_preview_pane(
+                    ui,
+                    active_tex,
+                    view_mode,
+                    self.preview_zoom_exact,
+                    &mut self.preview_scroll_offset,
+                    card_fill,
+                    border_color,
+                );
+            },
+        );
+        if let Some(new_exact_pct) = zoomed_pct {
+            self.preview_fixed_zoom = true;
+            self.preview_zoom_editing = false;
+            self.preview_zoom_exact = new_exact_pct.clamp(10.0, 500.0);
+            self.preview_zoom_pct = self.preview_zoom_exact.round().clamp(10.0, 500.0) as u16;
+            ui.ctx().request_repaint();
+        }
+    }
+
+    fn render_preview_placeholder(
+        ui: &mut egui::Ui,
+        card_fill: Color32,
+        border_color: Color32,
+        text_color: Color32,
+        message: &str,
+        show_spinner: bool,
+    ) {
+        let h = ui.available_height().max(220.0);
+        Frame::new()
+            .fill(card_fill)
+            .stroke(Stroke::new(1.0, border_color))
+            .corner_radius(CornerRadius::same(8))
+            .inner_margin(Margin::same(14))
+            .show(ui, |ui| {
+                let inner_w = ui.available_width().max(40.0);
+                let inner_h = (h - 30.0).max(160.0);
+                ui.set_min_size(egui::vec2(inner_w, inner_h));
+                ui.set_max_width(inner_w);
+                ui.vertical_centered(|ui| {
+                    ui.add_space(((inner_h - 28.0) * 0.5).max(0.0));
+                    if show_spinner {
+                        ui.add(egui::Spinner::new().size(15.0));
+                        ui.add_space(4.0);
+                    }
+                    ui.add(
+                        egui::Label::new(RichText::new(message).size(13.0).color(text_color))
+                            .wrap(),
+                    );
+                });
+            });
     }
 
     fn render_ui(&mut self, ui: &mut egui::Ui) {
         let ctx = ui.ctx().clone();
         self.poll_worker();
         self.handle_drag_and_drop(&ctx);
+        self.sync_preview_selection_and_poll(&ctx);
 
         let busy = self.is_busy();
         if busy {
@@ -1849,12 +2965,16 @@ impl PdfCompressorApp {
 
         let is_hovered = ctx.input(|i| !i.raw.hovered_files.is_empty());
         let fallback_size = ui.max_rect().size();
+        let show_preview = self.show_preview && self.active_index().is_some();
+        let (main_width, default_preview_width) = dpi_scaled_widths(&ctx);
 
         let panel_frame = Frame::central_panel(ui.style()).inner_margin(Margin::same(10));
         let panel_v_margin =
             f32::from(panel_frame.inner_margin.top) + f32::from(panel_frame.inner_margin.bottom);
 
-        let panel_resp = egui::CentralPanel::default()
+        let panel_resp = egui::Panel::left("main_panel")
+            .exact_size(main_width)
+            .resizable(false)
             .frame(panel_frame)
             .show(ui, |ui| {
                 egui::ScrollArea::vertical().show(ui, |ui| {
@@ -1902,44 +3022,122 @@ impl PdfCompressorApp {
                         }
                     }
 
-                    ui.add_space(10.0);
-                    self.render_summary_card(ui);
+                    if !self.files.is_empty() {
+                        ui.add_space(10.0);
+                        self.render_summary_card(ui)
+                    } else {
+                        0.0
+                    }
                 })
             });
+
+        if show_preview {
+            egui::CentralPanel::default()
+                .frame(
+                    Frame::new()
+                        .fill(ui.visuals().panel_fill)
+                        .inner_margin(Margin::same(10)),
+                )
+                .show(ui, |ui| {
+                    ui.set_width(ui.available_width());
+                    self.render_preview_panel(ui);
+                });
+        } else {
+            egui::CentralPanel::default()
+                .frame(Frame::new().fill(ui.visuals().panel_fill))
+                .show(ui, |_ui| {});
+        }
 
         #[cfg(test)]
         {
             self.last_content_width = panel_resp.inner.content_size.x;
         }
         let content_height = panel_resp.inner.content_size.y;
-        if content_height.is_finite() && content_height > 0.0 {
-            let max_fit_h = ctx
-                .input(|i| {
-                    i.viewport()
-                        .monitor_size
-                        .map(|m| (m.y - 80.0).max(MIN_WINDOW_HEIGHT))
-                })
-                .unwrap_or(960.0);
-            let ideal_height = (content_height + panel_v_margin + 2.0)
+        let extra_summary_h = panel_resp.inner.inner;
+        let min_content_height = (content_height - extra_summary_h).max(0.0);
+        let max_fit_h = ctx
+            .input(|i| i.viewport().monitor_size.map(|m| (m.y - 80.0).max(360.0)))
+            .unwrap_or(960.0);
+        let min_window_height = if min_content_height.is_finite() && min_content_height > 0.0 {
+            (min_content_height + panel_v_margin + 2.0)
                 .ceil()
-                .min(max_fit_h);
+                .min(max_fit_h)
+        } else {
+            MIN_WINDOW_HEIGHT
+        };
+
+        let preview_toggled = self.preview_panel_open != show_preview;
+        let lock_key = (
+            show_preview,
+            main_width.round() as u32,
+            min_window_height.round() as u32,
+        );
+        let lock_changed = self.last_viewport_lock_state != Some(lock_key);
+        if lock_changed {
+            self.last_viewport_lock_state = Some(lock_key);
+            if show_preview {
+                ctx.send_viewport_cmd(egui::ViewportCommand::MinInnerSize(egui::vec2(
+                    main_width + PREVIEW_MIN_WIDTH,
+                    min_window_height,
+                )));
+                ctx.send_viewport_cmd(egui::ViewportCommand::MaxInnerSize(egui::vec2(
+                    f32::INFINITY,
+                    f32::INFINITY,
+                )));
+            } else {
+                ctx.send_viewport_cmd(egui::ViewportCommand::MinInnerSize(egui::vec2(
+                    main_width,
+                    min_window_height,
+                )));
+                ctx.send_viewport_cmd(egui::ViewportCommand::MaxInnerSize(egui::vec2(
+                    main_width,
+                    f32::INFINITY,
+                )));
+            }
+        }
+
+        if (min_content_height.is_finite() && min_content_height > 0.0)
+            || preview_toggled
+            || lock_changed
+        {
             let height_changed = self
                 .last_fitted_height
-                .is_none_or(|prev| (prev - ideal_height).abs() > 1.0);
-            if height_changed {
-                self.last_fitted_height = Some(ideal_height);
-                let target_min_h = ideal_height.min(MIN_WINDOW_HEIGHT);
-                ctx.send_viewport_cmd(egui::ViewportCommand::MinInnerSize(egui::vec2(
-                    MIN_WINDOW_WIDTH,
-                    target_min_h,
-                )));
-                let current_size = ctx
-                    .input(|i| i.viewport().inner_rect.map(|r| r.size()))
-                    .unwrap_or(fallback_size);
-                if (current_size.y - ideal_height).abs() > 1.0 {
+                .is_none_or(|prev| (prev - min_window_height).abs() > 1.5);
+            let current_size = ctx
+                .input(|i| i.viewport().inner_rect.map(|r| r.size()))
+                .unwrap_or(fallback_size);
+
+            if preview_toggled
+                || height_changed
+                || current_size.y < min_window_height - 1.0
+                || (!show_preview && (current_size.x - main_width).abs() > 1.0)
+            {
+                self.last_fitted_height = Some(min_window_height);
+                if preview_toggled {
+                    self.preview_panel_open = show_preview;
+                }
+                let target_width = if show_preview {
+                    if preview_toggled {
+                        main_width + default_preview_width
+                    } else {
+                        current_size.x.max(main_width + PREVIEW_MIN_WIDTH)
+                    }
+                } else {
+                    main_width
+                };
+                let target_height = if height_changed {
+                    min_window_height
+                } else {
+                    current_size.y.max(min_window_height)
+                };
+
+                if preview_toggled
+                    || (current_size.y - target_height).abs() > 1.0
+                    || (current_size.x - target_width).abs() > 1.0
+                {
                     ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(
-                        current_size.x.max(MIN_WINDOW_WIDTH),
-                        ideal_height.max(target_min_h),
+                        target_width,
+                        target_height,
                     )));
                 }
             }
@@ -1950,6 +3148,217 @@ impl PdfCompressorApp {
 impl eframe::App for PdfCompressorApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.render_ui(ui);
+    }
+}
+
+fn render_preview_pane(
+    ui: &mut egui::Ui,
+    tex: Option<(egui::TextureId, u32, u32)>,
+    view_mode: PreviewViewMode,
+    current_exact_zoom_pct: f32,
+    scroll_offset: &mut egui::Vec2,
+    card_fill: Color32,
+    border_color: Color32,
+) -> Option<f32> {
+    let mut rendered_zoom_pct: Option<f32> = None;
+    let mut viewport_info: Option<(egui::Rect, egui::Vec2, u32, u32, f32)> = None;
+    let mut dragged_pan = false;
+
+    let frame_resp = Frame::new()
+        .fill(card_fill)
+        .stroke(Stroke::new(1.0, border_color))
+        .corner_radius(CornerRadius::same(8))
+        .inner_margin(Margin::same(8))
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+
+            let Some((tex_id, img_w, img_h)) = tex else {
+                ui.label(
+                    RichText::new("Unavailable")
+                        .size(12.0)
+                        .color(ui.visuals().weak_text_color()),
+                );
+                return;
+            };
+            if img_w == 0 || img_h == 0 {
+                return;
+            }
+
+            let avail = ui.available_size();
+            let viewport_w = avail.x.max(40.0);
+            let viewport_h = avail.y.max(120.0);
+            let ppp = ui.ctx().pixels_per_point().max(1.0);
+
+            let disp_size = match view_mode {
+                PreviewViewMode::Framing(PreviewFraming::Fit) => {
+                    let scale_x = viewport_w / (img_w as f32);
+                    let scale_y = viewport_h / (img_h as f32);
+                    let scale = scale_x.min(scale_y).max(0.01);
+                    let disp_w = ((img_w as f32) * scale).max(1.0);
+                    let disp_h = ((img_h as f32) * scale).max(1.0);
+                    rendered_zoom_pct = Some((disp_w * ppp / (img_w as f32)) * 100.0);
+                    egui::vec2(disp_w, disp_h)
+                }
+                PreviewViewMode::Framing(PreviewFraming::Fill) => {
+                    let scale = (viewport_w / (img_w as f32))
+                        .max(viewport_h / (img_h as f32))
+                        .max(0.01);
+                    let disp_w = ((img_w as f32) * scale).max(1.0);
+                    rendered_zoom_pct = Some((disp_w * ppp / (img_w as f32)) * 100.0);
+                    egui::vec2(disp_w, ((img_h as f32) * scale).max(1.0))
+                }
+                PreviewViewMode::Framing(PreviewFraming::Center) => {
+                    rendered_zoom_pct = Some(100.0);
+                    egui::vec2(
+                        ((img_w as f32) / ppp).max(1.0),
+                        ((img_h as f32) / ppp).max(1.0),
+                    )
+                }
+                PreviewViewMode::FixedZoomPct(pct) => {
+                    let effective_pct = if (current_exact_zoom_pct.round() as u16) == pct {
+                        current_exact_zoom_pct.clamp(10.0, 500.0)
+                    } else {
+                        f32::from(pct.clamp(10, 500))
+                    };
+                    rendered_zoom_pct = Some(effective_pct);
+                    let factor = effective_pct / 100.0;
+                    egui::vec2(
+                        (((img_w as f32) / ppp) * factor).max(1.0),
+                        (((img_h as f32) / ppp) * factor).max(1.0),
+                    )
+                }
+            };
+
+            let max_scroll = egui::vec2(
+                (disp_size.x - viewport_w).max(0.0),
+                (disp_size.y - viewport_h).max(0.0),
+            );
+            let pannable = max_scroll.x > 0.5 || max_scroll.y > 0.5;
+            *scroll_offset = scroll_offset.clamp(egui::Vec2::ZERO, max_scroll);
+
+            let scroll_out = egui::ScrollArea::both()
+                .id_salt("preview_scroll_single")
+                .max_width(viewport_w)
+                .max_height(viewport_h)
+                .auto_shrink([false, false])
+                .scroll_offset(*scroll_offset)
+                .show(ui, |ui| {
+                    let left_pad = ((viewport_w - disp_size.x) * 0.5).max(0.0);
+                    let top_pad = ((viewport_h - disp_size.y) * 0.5).max(0.0);
+                    let img_widget =
+                        egui::Image::new((tex_id, disp_size)).sense(egui::Sense::click_and_drag());
+                    let img_resp = if left_pad > 0.0 || top_pad > 0.0 {
+                        let canvas_size = egui::vec2(
+                            disp_size.x.max(viewport_w),
+                            disp_size.y.max(viewport_h),
+                        );
+                        ui.allocate_ui_with_layout(
+                            canvas_size,
+                            egui::Layout::top_down(egui::Align::Min),
+                            |ui| {
+                                ui.add_space(top_pad);
+                                ui.horizontal(|ui| {
+                                    ui.add_space(left_pad);
+                                    ui.add(img_widget)
+                                })
+                                .inner
+                            },
+                        )
+                        .inner
+                    } else {
+                        ui.add(img_widget)
+                    };
+
+                    if pannable {
+                        if img_resp.dragged_by(egui::PointerButton::Primary) {
+                            *scroll_offset = (*scroll_offset - img_resp.drag_delta())
+                                .clamp(egui::Vec2::ZERO, max_scroll);
+                            dragged_pan = true;
+                            ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
+                        } else if img_resp.hovered() {
+                            ui.ctx().set_cursor_icon(egui::CursorIcon::Grab);
+                        }
+                    }
+                });
+
+            if !dragged_pan {
+                *scroll_offset = scroll_out
+                    .state
+                    .clamped_offset()
+                    .clamp(egui::Vec2::ZERO, max_scroll);
+            }
+            viewport_info = Some((scroll_out.inner_rect, disp_size, img_w, img_h, ppp));
+        });
+
+    let base_zoom = rendered_zoom_pct?;
+    let (viewport_rect, disp_size, img_w, img_h, ppp) = viewport_info?;
+
+    let (zoom_delta, scroll_y, ctrl_held, pointer_pos) = ui.ctx().input(|i| {
+        let raw_wheel_y: f32 = i
+            .raw
+            .events
+            .iter()
+            .filter_map(|ev| match ev {
+                egui::Event::MouseWheel { unit, delta, .. } => {
+                    let px = match unit {
+                        egui::MouseWheelUnit::Point => delta.y,
+                        egui::MouseWheelUnit::Line => delta.y * 24.0,
+                        egui::MouseWheelUnit::Page => delta.y * 120.0,
+                    };
+                    Some(px)
+                }
+                _ => None,
+            })
+            .sum();
+        (
+            i.zoom_delta(),
+            raw_wheel_y,
+            i.modifiers.ctrl || i.modifiers.command,
+            i.pointer.hover_pos(),
+        )
+    });
+    let hovered = pointer_pos.is_some_and(|p| viewport_rect.contains(p))
+        || ui.rect_contains_pointer(frame_resp.response.rect);
+    if !hovered {
+        return None;
+    }
+
+    let factor = if (zoom_delta - 1.0).abs() > 1e-4 {
+        zoom_delta
+    } else if ctrl_held && scroll_y.abs() > 0.0 {
+        1.1_f32.powf(scroll_y / 40.0)
+    } else {
+        1.0
+    };
+
+    if (factor - 1.0).abs() > 1e-4 && factor.is_finite() && factor > 0.0 {
+        let new_exact_pct = (base_zoom * factor).clamp(10.0, 500.0);
+        let old_zoom = (base_zoom / 100.0).max(0.01);
+        let new_zoom = (new_exact_pct / 100.0).max(0.01);
+        let cursor_rel = pointer_pos
+            .map(|p| p - viewport_rect.min)
+            .unwrap_or_else(|| viewport_rect.size() * 0.5);
+        let viewport_size = viewport_rect.size();
+        let old_pad = egui::vec2(
+            ((viewport_size.x - disp_size.x) * 0.5).max(0.0),
+            ((viewport_size.y - disp_size.y) * 0.5).max(0.0),
+        );
+        let content_pos = (*scroll_offset + cursor_rel - old_pad) / old_zoom;
+        let new_disp_w = ((img_w as f32) / ppp) * new_zoom;
+        let new_disp_h = ((img_h as f32) / ppp) * new_zoom;
+        let new_pad = egui::vec2(
+            ((viewport_size.x - new_disp_w) * 0.5).max(0.0),
+            ((viewport_size.y - new_disp_h) * 0.5).max(0.0),
+        );
+        let new_max_scroll = egui::vec2(
+            (new_disp_w - viewport_size.x).max(0.0),
+            (new_disp_h - viewport_size.y).max(0.0),
+        );
+        *scroll_offset = (content_pos * new_zoom + new_pad - cursor_rel)
+            .clamp(egui::Vec2::ZERO, new_max_scroll);
+        Some(new_exact_pct)
+    } else {
+        None
     }
 }
 
@@ -1970,7 +3379,9 @@ fn recalculate_item_with_delta(item: &mut PdfFileItem, delta: Option<SettingsDel
             let at_default_full_bounds = target_bytes >= item.summary.file_bytes
                 && item.settings.options.quality == 100
                 && (item.settings.options.scale - 1.0).abs() < 1e-4
-                && delta.is_some_and(|d| !(d.format_changed || d.filter_changed));
+                && delta.is_some_and(|d| {
+                    !(d.format_changed || d.color_depth_changed || d.filter_changed)
+                });
 
             if !at_default_full_bounds {
                 match delta {
@@ -1983,6 +3394,7 @@ fn recalculate_item_with_delta(item: &mut PdfFileItem, delta: Option<SettingsDel
                             || d.target_mb_changed
                             || d.target_pct_changed
                             || d.format_changed
+                            || d.color_depth_changed
                             || d.filter_changed =>
                     {
                         item.summary
@@ -2017,17 +3429,73 @@ fn item_output_stem(item: &PdfFileItem) -> String {
         .unwrap_or_else(|| "document".to_string())
 }
 
+fn formatted_output_filename(stem: &str, suffix: &str) -> String {
+    format!("{stem}{suffix}.pdf")
+}
+
+/// Writes `bytes` to `dest_path`. When overwriting an existing file (e.g., in-place when
+/// `suffix` is empty), writes to a sibling `.tmp` file first and atomically renames it over
+/// `dest_path` so Windows file locks never corrupt the target file.
+fn write_pdf_bytes_safely(dest_path: &Path, bytes: &[u8]) -> Result<(), String> {
+    if !dest_path.exists() {
+        return std::fs::write(dest_path, bytes)
+            .map_err(|e| format!("Failed to save {}: {e}", dest_path.display()));
+    }
+
+    let parent = dest_path.parent().unwrap_or_else(|| Path::new("."));
+    let stem = dest_path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .filter(|s| !s.is_empty())
+        .unwrap_or("compressed");
+    let pid = std::process::id();
+    let mut tmp_path = parent.join(format!(".{stem}.{pid}.tmp"));
+    let mut counter = 0usize;
+    while tmp_path.exists() {
+        counter += 1;
+        tmp_path = parent.join(format!(".{stem}.{pid}.{counter}.tmp"));
+    }
+
+    {
+        use std::io::Write;
+        let mut f = std::fs::File::create(&tmp_path)
+            .map_err(|e| format!("Failed to create temporary file {}: {e}", tmp_path.display()))?;
+        if let Err(e) = f.write_all(bytes).and_then(|_| f.sync_all()) {
+            drop(f);
+            let _ = std::fs::remove_file(&tmp_path);
+            return Err(format!("Failed to write {}: {e}", tmp_path.display()));
+        }
+    }
+
+    match std::fs::rename(&tmp_path, dest_path) {
+        Ok(()) => Ok(()),
+        Err(first_err) => {
+            if std::fs::remove_file(dest_path).is_ok()
+                && std::fs::rename(&tmp_path, dest_path).is_ok()
+            {
+                return Ok(());
+            }
+            let _ = std::fs::remove_file(&tmp_path);
+            Err(format!(
+                "Failed to replace {}: {first_err}",
+                dest_path.display()
+            ))
+        }
+    }
+}
+
 fn unique_batch_output_paths(files: &[PdfFileItem], folder: &Path) -> Vec<PathBuf> {
     let mut used = HashSet::with_capacity(files.len());
     let mut paths = Vec::with_capacity(files.len());
 
     for item in files {
         let stem = item_output_stem(item);
-        let mut candidate = format!("{stem}_compressed.pdf");
-        let mut suffix = 2usize;
+        let suffix = item.settings.suffix.as_str();
+        let mut candidate = formatted_output_filename(&stem, suffix);
+        let mut n = 2usize;
         while !used.insert(candidate.to_lowercase()) {
-            candidate = format!("{stem}_compressed_{suffix}.pdf");
-            suffix += 1;
+            candidate = format!("{stem}{suffix}_{n}.pdf");
+            n += 1;
         }
         paths.push(folder.join(candidate));
     }
@@ -2076,13 +3544,20 @@ fn table_header_bg(dark: bool) -> Color32 {
     }
 }
 
+#[cfg(test)]
 fn split_row_columns<const N: usize>(row_rect: egui::Rect, widths: [f32; N]) -> [egui::Rect; N] {
+    let mut rects = [egui::Rect::NOTHING; N];
+    split_row_columns_into(row_rect, &widths, &mut rects);
+    rects
+}
+
+fn split_row_columns_into(row_rect: egui::Rect, widths: &[f32], out: &mut [egui::Rect]) {
+    let n = out.len().min(widths.len());
     let y0 = row_rect.min.y;
     let y1 = row_rect.max.y;
-    let mut rects = [egui::Rect::NOTHING; N];
     let mut x = row_rect.min.x;
-    for (idx, rect) in rects.iter_mut().enumerate() {
-        let next_x = if idx + 1 == N {
+    for (idx, rect) in out[..n].iter_mut().enumerate() {
+        let next_x = if idx + 1 == n {
             row_rect.max.x
         } else {
             (x + widths[idx]).min(row_rect.max.x)
@@ -2090,9 +3565,9 @@ fn split_row_columns<const N: usize>(row_rect: egui::Rect, widths: [f32; N]) -> 
         *rect = egui::Rect::from_min_max(egui::pos2(x, y0), egui::pos2(next_x, y1));
         x = next_x;
     }
-    rects
 }
 
+#[inline]
 fn render_table_header_row<const N: usize>(
     ui: &mut egui::Ui,
     total_w: f32,
@@ -2100,9 +3575,10 @@ fn render_table_header_row<const N: usize>(
     aligns: [egui::Align; N],
     titles: [&str; N],
 ) {
-    let _ = render_table_header_row_interactive(ui, total_w, widths, aligns, titles, None);
+    let _ = render_table_header_row_interactive_slice(ui, total_w, &widths, &aligns, &titles, None);
 }
 
+#[inline]
 fn render_table_header_row_interactive<const N: usize>(
     ui: &mut egui::Ui,
     total_w: f32,
@@ -2111,15 +3587,35 @@ fn render_table_header_row_interactive<const N: usize>(
     titles: [&str; N],
     interactive_col: Option<(usize, egui::Id, &str)>,
 ) -> bool {
+    render_table_header_row_interactive_slice(
+        ui,
+        total_w,
+        &widths,
+        &aligns,
+        &titles,
+        interactive_col,
+    )
+}
+
+fn render_table_header_row_interactive_slice(
+    ui: &mut egui::Ui,
+    total_w: f32,
+    widths: &[f32],
+    aligns: &[egui::Align],
+    titles: &[&str],
+    interactive_col: Option<(usize, egui::Id, &str)>,
+) -> bool {
     let dark = ui.visuals().dark_mode;
     let divider_color = table_header_divider_color(dark);
     let (header_rect, _) =
         ui.allocate_exact_size(egui::vec2(total_w, TABLE_HEADER_HEIGHT), egui::Sense::hover());
 
+    let mut col_rects: SmallVec<[egui::Rect; 8]> = smallvec::smallvec![egui::Rect::NOTHING; widths.len()];
+    split_row_columns_into(header_rect, widths, &mut col_rects);
+
     let mut clicked = false;
     let mut hovered_col_rect: Option<egui::Rect> = None;
     if let Some((col_idx, interact_id, tooltip)) = interactive_col {
-        let col_rects = split_row_columns(header_rect, widths);
         if let Some(&target_rect) = col_rects.get(col_idx) {
             let resp = ui.interact(target_rect, interact_id, egui::Sense::click());
             if resp.hovered() {
@@ -2149,15 +3645,18 @@ fn render_table_header_row_interactive<const N: usize>(
         Stroke::new(1.0, divider_color),
     );
 
-    paint_row_cells(
+    let weak_color = Some(ui.visuals().weak_text_color());
+    let colors: SmallVec<[Option<Color32>; 8]> = smallvec::smallvec![weak_color; widths.len()];
+    let strong: SmallVec<[bool; 8]> = smallvec::smallvec![true; widths.len()];
+    paint_row_cells_slice(
         ui,
         header_rect,
-        &TableRowCells {
+        &TableRowCellsSlice {
             widths,
             aligns,
             texts: titles,
-            colors: [Some(ui.visuals().weak_text_color()); N],
-            strong: [true; N],
+            colors: &colors,
+            strong: &strong,
             font_size: 12.0,
             divider_stroke: Stroke::new(1.0, divider_color),
             divider_v_inset: 4.0,
@@ -2178,22 +3677,56 @@ struct TableRowCells<'a, const N: usize> {
     divider_v_inset: f32,
 }
 
+struct TableRowCellsSlice<'a> {
+    widths: &'a [f32],
+    aligns: &'a [egui::Align],
+    texts: &'a [&'a str],
+    colors: &'a [Option<Color32>],
+    strong: &'a [bool],
+    font_size: f32,
+    divider_stroke: Stroke,
+    divider_v_inset: f32,
+}
+
+#[inline]
 fn paint_row_cells<const N: usize>(
     ui: &egui::Ui,
     row_rect: egui::Rect,
     cells: &TableRowCells<'_, N>,
 ) {
-    let col_rects = split_row_columns(row_rect, cells.widths);
+    paint_row_cells_slice(
+        ui,
+        row_rect,
+        &TableRowCellsSlice {
+            widths: &cells.widths,
+            aligns: &cells.aligns,
+            texts: &cells.texts,
+            colors: &cells.colors,
+            strong: &cells.strong,
+            font_size: cells.font_size,
+            divider_stroke: cells.divider_stroke,
+            divider_v_inset: cells.divider_v_inset,
+        },
+    );
+}
+
+fn paint_row_cells_slice(
+    ui: &egui::Ui,
+    row_rect: egui::Rect,
+    cells: &TableRowCellsSlice<'_>,
+) {
+    let n = cells.widths.len();
+    let mut col_rects: SmallVec<[egui::Rect; 8]> = smallvec::smallvec![egui::Rect::NOTHING; n];
+    split_row_columns_into(row_rect, cells.widths, &mut col_rects);
     let painter = ui.painter();
     let div_y0 = row_rect.min.y + cells.divider_v_inset;
     let div_y1 = row_rect.max.y - cells.divider_v_inset;
-    for col in &col_rects[..N.saturating_sub(1)] {
+    col_rects[..n.saturating_sub(1)].iter().for_each(|col| {
         painter.vline(col.max.x, div_y0..=div_y1, cells.divider_stroke);
-    }
+    });
 
     let fallback_color = ui.visuals().text_color();
-    for col in 0..N {
-        let col_rect = col_rects[col];
+    for (col, &col_rect) in col_rects.iter().enumerate() {
         let inner_min_x = col_rect.min.x + TABLE_CELL_PAD_X;
         let inner_max_x = (col_rect.max.x - TABLE_CELL_PAD_X).max(inner_min_x + 1.0);
         let cell_rect = egui::Rect::from_min_max(
@@ -2319,48 +3852,12 @@ fn neutral_card_border(dark: bool) -> Color32 {
     }
 }
 
-fn read_pdf_from_path(path: PathBuf) -> Result<(Option<PathBuf>, String, Vec<u8>), String> {
-    let bytes = std::fs::read(&path).map_err(|err| format!("{} ({err})", path.display()))?;
-    let file_name = path
-        .file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "document.pdf".to_string());
-    Ok((Some(path), file_name, bytes))
-}
-
 fn format_saved_pct(saved_pct: f64) -> String {
     if saved_pct >= 0.0 {
         format!("{saved_pct:.1}%")
     } else {
         format!("+{:.1}% larger", saved_pct.abs())
     }
-}
-
-fn format_compression_summary_note(stats: &CompressionStats) -> String {
-    if stats.total_image_objects == 0 {
-        return "0 images found; structure optimized".to_string();
-    }
-    let mut parts = vec![format!(
-        "{}/{} recompressed",
-        stats.images_recompressed, stats.total_image_objects
-    )];
-    if stats.images_kept_original > 0 {
-        parts.push(format!("{} kept", stats.images_kept_original));
-    }
-    if stats.images_skipped_small_or_mask > 0 {
-        parts.push(format!("{} small/masks", stats.images_skipped_small_or_mask));
-    }
-    if stats.images_skipped_unsupported > 0 {
-        if let Some(first_reason) = stats.skipped_reasons.first() {
-            parts.push(format!(
-                "{} skipped ({first_reason})",
-                stats.images_skipped_unsupported
-            ));
-        } else {
-            parts.push(format!("{} skipped", stats.images_skipped_unsupported));
-        }
-    }
-    parts.join(", ")
 }
 
 fn target_decimals_for_mb(max_mb: f64) -> usize {
@@ -2390,6 +3887,9 @@ fn format_bytes(bytes: usize) -> String {
 mod tests {
     use super::*;
 
+    const ACTIVE_DEFAULT_WINDOW_WIDTH: f32 = DEFAULT_WINDOW_WIDTH + PREVIEW_DEFAULT_WIDTH;
+    const ACTIVE_MIN_WINDOW_WIDTH: f32 = MIN_WINDOW_WIDTH + PREVIEW_DEFAULT_WIDTH;
+
     fn make_test_item(name: &str, file_bytes: usize) -> PdfFileItem {
         let img_count = (file_bytes / 60_000).max(10);
         let sample_orig_bytes = file_bytes.saturating_sub(10_000) / img_count;
@@ -2405,10 +3905,11 @@ mod tests {
         let settings = CompressionSettings::for_file(bytes_to_mb(file_bytes) as f32);
         let cached_estimated_bytes = summary.estimate_compressed_bytes(&settings.options);
         PdfFileItem {
+            source_id: next_file_source_id(),
             path: Some(PathBuf::from(format!(r"C:\docs\{name}"))),
             file_name: name.to_string(),
             original_size_mb: bytes_to_mb(file_bytes),
-            bytes: Arc::new(Vec::new()),
+            in_memory_bytes: None,
             summary,
             settings,
             cached_estimated_bytes,
@@ -2468,30 +3969,50 @@ mod tests {
             })
     }
 
+    fn has_viewport_bounds_cmds(output: &egui::FullOutput) -> (Option<egui::Vec2>, Option<egui::Vec2>) {
+        let mut min_sz = None;
+        let mut max_sz = None;
+        if let Some(vo) = output.viewport_output.get(&egui::ViewportId::ROOT) {
+            for cmd in &vo.commands {
+                match cmd {
+                    egui::ViewportCommand::MinInnerSize(sz) => min_sz = Some(*sz),
+                    egui::ViewportCommand::MaxInnerSize(sz) => max_sz = Some(*sz),
+                    _ => {}
+                }
+            }
+        }
+        (min_sz, max_sz)
+    }
+
     #[test]
     fn tight_viewport_height_fits_before_and_after_save_without_churn() {
         let ctx = egui::Context::default();
         let mut app = PdfCompressorApp::default();
 
-        // Initial launch at 520x440
+        // DPI-scaled widths default to 1920pt fallback (27.5% = 528, 42.5% = 816, total = 70% = 1344).
+        assert_eq!(dpi_scaled_widths(&ctx), (DEFAULT_WINDOW_WIDTH, PREVIEW_DEFAULT_WIDTH));
+
+        // Initial launch with 0 files: Compression Summary is hidden, horizontal width locked to main_width.
         let out1 = run_frame(&ctx, &mut app, DEFAULT_WINDOW_WIDTH, DEFAULT_WINDOW_HEIGHT);
+        let (min1, max1) = has_viewport_bounds_cmds(&out1);
         let initial_fitted = app
             .last_fitted_height
             .expect("initial height should be measured");
+        assert_eq!(min1, Some(egui::vec2(DEFAULT_WINDOW_WIDTH, initial_fitted)));
+        assert_eq!(max1, Some(egui::vec2(DEFAULT_WINDOW_WIDTH, f32::INFINITY)));
         assert!(
-            (370.0..=465.0).contains(&initial_fitted),
-            "expected tight initial height before compression, got {initial_fitted}"
+            (320.0..=420.0).contains(&initial_fitted),
+            "expected tight initial height without Compression Summary, got {initial_fitted}"
         );
 
         // Next frame at fitted height emits no further InnerSize command (no jitter/loop)
         let out2 = run_frame(&ctx, &mut app, DEFAULT_WINDOW_WIDTH, initial_fitted);
         assert_eq!(has_inner_size_cmd(&out2), None);
-        let _ = out1;
 
         // Simulate single-file completed save ("Saved to: ..." appears in Compression Summary)
         let mut item = make_test_item("homework.pdf", 4 * 1024 * 1024);
-        item.result = Some(CompressionResult::from_stats(
-            PathBuf::from(r"C:\Users\demo\homework_compressed.pdf"),
+        item.result = Some(Box::new(CompressionResult::from_stats(
+            PathBuf::from(r"C:\Users\demo\homework-compressed.pdf"),
             CompressionStats {
                 original_bytes: 4 * 1024 * 1024,
                 compressed_bytes: 1_200_000,
@@ -2499,44 +4020,77 @@ mod tests {
             },
             &item.settings,
             item.original_size_mb,
-        ));
+        )));
         app.files = vec![item];
         app.selected_indices.insert(0);
         app.selection_anchor = Some(0);
+        app.show_preview = true;
 
         let out3 = run_frame(&ctx, &mut app, DEFAULT_WINDOW_WIDTH, initial_fitted);
         let post_save_fitted = app.last_fitted_height.expect("post-save height measured");
         assert!(
-            post_save_fitted > initial_fitted,
-            "window should expand for 'Saved to: ...' ({initial_fitted} -> {post_save_fitted})"
+            post_save_fitted >= initial_fitted,
+            "window height should accommodate 'Saved to: ...' and preview ({initial_fitted} -> {post_save_fitted})"
         );
-        let requested = has_inner_size_cmd(&out3).expect("should emit InnerSize when height grows");
-        assert!((requested.x - DEFAULT_WINDOW_WIDTH).abs() < 0.5);
+        let requested = has_inner_size_cmd(&out3).expect("should emit InnerSize when preview opens");
+        assert!((requested.x - ACTIVE_DEFAULT_WINDOW_WIDTH).abs() < 0.5);
         assert!((requested.y - post_save_fitted).abs() < 0.5);
+        let (min3, max3) = has_viewport_bounds_cmds(&out3);
+        assert_eq!(min3, Some(egui::vec2(DEFAULT_WINDOW_WIDTH + PREVIEW_MIN_WIDTH, post_save_fitted)));
+        assert_eq!(max3, Some(egui::vec2(f32::INFINITY, f32::INFINITY)));
 
-        // Subsequent frame at new fitted height settles with no further resize
-        let out4 = run_frame(&ctx, &mut app, DEFAULT_WINDOW_WIDTH, post_save_fitted);
+        // Subsequent frame at expanded preview size settles with no further resize
+        let out4 = run_frame(
+            &ctx,
+            &mut app,
+            ACTIVE_DEFAULT_WINDOW_WIDTH,
+            post_save_fitted,
+        );
         assert_eq!(has_inner_size_cmd(&out4), None);
 
-        // Narrowest supported width (480px) fits controls cleanly without horizontal overflow
-        let mut compact_app = PdfCompressorApp::default();
+        // Clearing files collapses preview side panel, restores main window width, and locks horizontal resize
+        app.clear_files();
+        let out_collapse = run_frame(
+            &ctx,
+            &mut app,
+            ACTIVE_DEFAULT_WINDOW_WIDTH,
+            post_save_fitted,
+        );
+        let collapsed = has_inner_size_cmd(&out_collapse)
+            .expect("clearing files should collapse window back to default width");
+        assert!((collapsed.x - DEFAULT_WINDOW_WIDTH).abs() < 0.5);
+        let (min_col, max_col) = has_viewport_bounds_cmds(&out_collapse);
+        assert_eq!(min_col, Some(egui::vec2(DEFAULT_WINDOW_WIDTH, initial_fitted)));
+        assert_eq!(max_col, Some(egui::vec2(DEFAULT_WINDOW_WIDTH, f32::INFINITY)));
+
+        // Narrowest supported active width (528px locked main + preview) fits cleanly without overflow
+        let compact_ctx = egui::Context::default();
         let mut compact_item = make_test_item("homework_scan_2026.pdf", 3_500_000);
         compact_item.settings.options.format = ImageFormatChoice::Png;
         compact_item.settings.target_mode = TargetMode::Megabytes;
-        compact_app.files = vec![compact_item];
-        compact_app.selected_indices.insert(0);
-        compact_app.selection_anchor = Some(0);
-        let _out5 = run_frame(&ctx, &mut compact_app, MIN_WINDOW_WIDTH, DEFAULT_WINDOW_HEIGHT);
+        let mut compact_app = PdfCompressorApp {
+            show_preview: true,
+            files: vec![compact_item],
+            selected_indices: BTreeSet::from([0]),
+            selection_anchor: Some(0),
+            ..Default::default()
+        };
+        let _out5 = run_frame(
+            &compact_ctx,
+            &mut compact_app,
+            ACTIVE_MIN_WINDOW_WIDTH,
+            MIN_PREVIEW_WINDOW_HEIGHT,
+        );
         let compact_height = compact_app
             .last_fitted_height
             .expect("compact height should be measured");
         assert!(
-            (370.0..=465.0).contains(&compact_height),
-            "expected compact layout without extra line-wraps at {MIN_WINDOW_WIDTH}px width, got {compact_height}"
+            (MIN_PREVIEW_WINDOW_HEIGHT..=600.0).contains(&compact_height),
+            "expected compact active layout at {ACTIVE_MIN_WINDOW_WIDTH}px width, got {compact_height}"
         );
         assert!(
             compact_app.last_content_width <= MIN_WINDOW_WIDTH - 20.0 + 0.5,
-            "expected controls at {MIN_WINDOW_WIDTH}px window width to fit inside {}px panel width without horizontal overflow, got {}px",
+            "expected controls at {ACTIVE_MIN_WINDOW_WIDTH}px window width to fit inside {}px central width without horizontal overflow, got {}px",
             MIN_WINDOW_WIDTH - 20.0,
             compact_app.last_content_width
         );
@@ -2546,11 +4100,8 @@ mod tests {
     fn estimated_size_and_summary_metrics_follow_state_transitions() {
         let mut app = PdfCompressorApp::default();
 
-        // Unloaded: summary shows dashes
-        assert_eq!(
-            app.single_summary_metrics(),
-            ("-".to_string(), "-".to_string(), "-".to_string(), false)
-        );
+        // Unloaded: no files
+        assert!(app.files.is_empty());
 
         // Loaded before compression: inline estimate has no tilde and summary shows muted estimate
         let item = make_test_item("notes.pdf", 4_000_000);
@@ -2562,17 +4113,15 @@ mod tests {
         app.files = vec![item];
         app.selected_indices.insert(0);
         app.selection_anchor = Some(0);
-        let (orig, new_sz, saved, is_est) = app.single_summary_metrics();
-        assert_ne!(orig, "-");
-        assert_eq!(new_sz, "-");
-        assert!(saved.starts_with('~') && saved.ends_with('%') && !saved.contains("est."));
-        assert!(is_est);
+        let est = app.files[0].estimated_compressed_bytes();
+        assert!(est > 0);
         assert_eq!(ImageFormatChoice::Png.label(), "PNG");
+        assert!(app.files[0].estimated_saved_percentage().is_some());
 
-        // After compression: actual percentage replaces muted estimate as bold actual text
+        // After compression: actual new size & saved percentage are populated
         let orig_mb = app.files[0].original_size_mb;
-        app.files[0].result = Some(CompressionResult::from_stats(
-            PathBuf::from("notes_compressed.pdf"),
+        app.files[0].result = Some(Box::new(CompressionResult::from_stats(
+            PathBuf::from("notes-compressed.pdf"),
             CompressionStats {
                 original_bytes: 4_000_000,
                 compressed_bytes: 1_156_000,
@@ -2580,22 +4129,21 @@ mod tests {
             },
             &app.files[0].settings,
             orig_mb,
-        ));
-        let (orig, new_sz, saved, is_est) = app.single_summary_metrics();
-        assert_ne!(orig, "-");
-        assert_ne!(new_sz, "-");
-        assert_eq!(saved, "71.1%");
-        assert!(!is_est);
+        )));
+        let res = app.files[0].result.as_ref().unwrap();
+        assert_eq!(format_saved_pct(res.space_saved_pct), "71.1%");
     }
 
     #[test]
     fn multi_select_click_ctrl_shift_and_ctrl_a_behave_accurately() {
-        let mut app = PdfCompressorApp::default();
-        app.files = (1..=6)
-            .map(|i| make_test_item(&format!("page_{i}.pdf"), i * 1_000_000))
-            .collect();
-        app.selected_indices.insert(0);
-        app.selection_anchor = Some(0);
+        let mut app = PdfCompressorApp {
+            files: (1..=6)
+                .map(|i| make_test_item(&format!("page_{i}.pdf"), i * 1_000_000))
+                .collect(),
+            selected_indices: BTreeSet::from([0]),
+            selection_anchor: Some(0),
+            ..Default::default()
+        };
 
         // Plain click selects only row 2 and updates anchor
         app.handle_row_click(2, egui::Modifiers::NONE);
@@ -2655,14 +4203,16 @@ mod tests {
 
     #[test]
     fn per_file_vs_apply_for_all_clamping_and_batch_export_paths() {
-        let mut app = PdfCompressorApp::default();
-        app.files = vec![
-            make_test_item("small.pdf", 1_000_000),   // ~0.95 MB
-            make_test_item("medium.pdf", 4_000_000),  // ~3.81 MB
-            make_test_item("same\\small.pdf", 8_000_000),
-        ];
-        app.selected_indices = BTreeSet::from([1]);
-        app.selection_anchor = Some(1);
+        let mut app = PdfCompressorApp {
+            files: vec![
+                make_test_item("small.pdf", 1_000_000),   // ~0.95 MB
+                make_test_item("medium.pdf", 4_000_000),  // ~3.81 MB
+                make_test_item("same\\small.pdf", 8_000_000),
+            ],
+            selected_indices: BTreeSet::from([1]),
+            selection_anchor: Some(1),
+            ..Default::default()
+        };
 
         // With Apply for ALL unchecked, changing quality affects only selected index 1
         let mut draft = app.files[1].settings.clone();
@@ -2717,26 +4267,47 @@ mod tests {
         assert!(app.files[1].settings.target_size_mb <= app.files[1].original_size_mb as f32 + 1e-5);
         assert!((app.files[2].settings.target_size_mb - 5.0).abs() < 1e-4);
 
-        // Unique batch output paths preserve <stem>_compressed.pdf and disambiguate collisions
+        // Unique batch output paths preserve <stem><suffix>.pdf and disambiguate collisions
         let out_dir = PathBuf::from(r"C:\out");
         let paths = unique_batch_output_paths(&app.files, &out_dir);
-        assert_eq!(paths[0], out_dir.join("small_compressed.pdf"));
-        assert_eq!(paths[1], out_dir.join("medium_compressed.pdf"));
+        assert_eq!(paths[0], out_dir.join("small-compressed.pdf"));
+        assert_eq!(paths[1], out_dir.join("medium-compressed.pdf"));
         assert_ne!(paths[2], paths[0]);
+
+        // Empty suffix saves with exact original filename, and write_pdf_bytes_safely overwrites atomically
+        app.files[0].settings.suffix.clear();
+        let paths_empty = unique_batch_output_paths(&app.files, &out_dir);
+        assert_eq!(paths_empty[0], out_dir.join("small.pdf"));
+
+        let temp_dir = std::env::temp_dir().join(format!(
+            "pdf_comp_atomic_save_test_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::create_dir_all(&temp_dir);
+        let target_file = temp_dir.join("in_place.pdf");
+        std::fs::write(&target_file, b"%PDF-old").expect("seed existing file");
+        write_pdf_bytes_safely(&target_file, b"%PDF-new-compressed").expect("safe overwrite");
+        assert_eq!(
+            std::fs::read(&target_file).expect("read overwritten file"),
+            b"%PDF-new-compressed"
+        );
+        let _ = std::fs::remove_dir_all(&temp_dir);
     }
 
     #[test]
     fn batch_ui_renders_cleanly_at_min_width_and_caps_scroll_for_many_files() {
         let ctx = egui::Context::default();
-        let mut app_small_batch = PdfCompressorApp::default();
-        app_small_batch.files = (1..=3)
-            .map(|i| make_test_item(&format!("doc_{i}.pdf"), (i + 1) * 1_500_000))
-            .collect();
-        app_small_batch.selected_indices = BTreeSet::from([0]);
-        app_small_batch.selection_anchor = Some(0);
+        let mut app_small_batch = PdfCompressorApp {
+            files: (1..=3)
+                .map(|i| make_test_item(&format!("doc_{i}.pdf"), (i + 1) * 1_500_000))
+                .collect(),
+            selected_indices: BTreeSet::from([0]),
+            selection_anchor: Some(0),
+            ..Default::default()
+        };
         app_small_batch.files[0].settings.target_mode = TargetMode::Megabytes;
         app_small_batch.files[0].settings.target_size_mb = 1.0;
-        app_small_batch.files[0].result = Some(CompressionResult::from_stats(
+        app_small_batch.files[0].result = Some(Box::new(CompressionResult::from_stats(
             PathBuf::from(r"C:\out\doc_1_compressed.pdf"),
             CompressionStats {
                 original_bytes: 3_000_000,
@@ -2745,10 +4316,10 @@ mod tests {
             },
             &app_small_batch.files[0].settings,
             app_small_batch.files[0].original_size_mb,
-        ));
+        )));
         assert!(app_small_batch.files[0].result.as_ref().unwrap().over_target);
 
-        app_small_batch.files[1].result = Some(CompressionResult::from_stats(
+        app_small_batch.files[1].result = Some(Box::new(CompressionResult::from_stats(
             PathBuf::from(r"C:\out\doc_2_compressed.pdf"),
             CompressionStats {
                 original_bytes: 4_500_000,
@@ -2757,28 +4328,32 @@ mod tests {
             },
             &app_small_batch.files[1].settings,
             app_small_batch.files[1].original_size_mb,
-        ));
+        )));
         assert!(!app_small_batch.files[1].result.as_ref().unwrap().over_target);
         app_small_batch.batch_saved_folder = Some(PathBuf::from(r"C:\out"));
+        app_small_batch.show_preview = true;
 
-        let _ = run_frame(&ctx, &mut app_small_batch, MIN_WINDOW_WIDTH, 700.0);
+        let _ = run_frame(&ctx, &mut app_small_batch, ACTIVE_MIN_WINDOW_WIDTH, 700.0);
         assert!(
             app_small_batch.last_content_width <= MIN_WINDOW_WIDTH - 20.0 + 0.5,
-            "multi-file UI overflowed {MIN_WINDOW_WIDTH}px width: {}px",
+            "multi-file UI overflowed {MIN_WINDOW_WIDTH}px central width: {}px",
             app_small_batch.last_content_width
         );
         let three_file_h = app_small_batch.last_fitted_height.unwrap();
 
-        let mut app_large_batch = PdfCompressorApp::default();
-        app_large_batch.files = (1..=15)
-            .map(|i| make_test_item(&format!("scan_{i:02}.pdf"), 2_500_000))
-            .collect();
-        app_large_batch.selected_indices = BTreeSet::from([0]);
-        app_large_batch.selection_anchor = Some(0);
-        let _ = run_frame(&ctx, &mut app_large_batch, DEFAULT_WINDOW_WIDTH, 900.0);
+        let mut app_large_batch = PdfCompressorApp {
+            show_preview: true,
+            files: (1..=15)
+                .map(|i| make_test_item(&format!("scan_{i:02}.pdf"), 2_500_000))
+                .collect(),
+            selected_indices: BTreeSet::from([0]),
+            selection_anchor: Some(0),
+            ..Default::default()
+        };
+        let _ = run_frame(&ctx, &mut app_large_batch, ACTIVE_DEFAULT_WINDOW_WIDTH, 900.0);
         let fifteen_file_h = app_large_batch.last_fitted_height.unwrap();
         assert!(
-            fifteen_file_h > three_file_h && fifteen_file_h < 900.0,
+            fifteen_file_h > three_file_h && fifteen_file_h < 950.0,
             "15-file batch height ({fifteen_file_h}) should expand cleanly up to capped visible rows"
         );
     }
@@ -2811,21 +4386,24 @@ mod tests {
         assert_eq!(cols[3].max.x, row_rect.max.x);
 
         let ctx = egui::Context::default();
-        let mut app = PdfCompressorApp::default();
-        app.files = vec![
-            make_test_item("short.pdf", 1_200_000),
-            make_test_item(
-                "very_long_scanned_homework_document_filename_2026_semester_final_submission_v3.pdf",
-                2_400_000,
-            ),
-        ];
-        app.selected_indices = BTreeSet::from([0]);
-        app.selection_anchor = Some(0);
+        let mut app = PdfCompressorApp {
+            files: vec![
+                make_test_item("short.pdf", 1_200_000),
+                make_test_item(
+                    "very_long_scanned_homework_document_filename_2026_semester_final_submission_v3.pdf",
+                    2_400_000,
+                ),
+            ],
+            selected_indices: BTreeSet::from([0]),
+            selection_anchor: Some(0),
+            show_preview: true,
+            ..Default::default()
+        };
 
-        let _ = run_frame(&ctx, &mut app, MIN_WINDOW_WIDTH, 700.0);
+        let _ = run_frame(&ctx, &mut app, ACTIVE_MIN_WINDOW_WIDTH, 700.0);
         assert!(
             app.last_content_width <= MIN_WINDOW_WIDTH - 20.0 + 0.5,
-            "long filenames should truncate instead of overflowing {MIN_WINDOW_WIDTH}px: {}px",
+            "long filenames should truncate instead of overflowing {MIN_WINDOW_WIDTH}px central width: {}px",
             app.last_content_width
         );
     }
@@ -2840,20 +4418,22 @@ mod tests {
 
         // Verify JPG/JPEG 2000/PNG render with identical controls height (no compatibility warning banner).
         let ctx = egui::Context::default();
-        let mut app = PdfCompressorApp::default();
-        app.files = vec![make_test_item("one.pdf", 2_000_000)];
-        app.selected_indices = BTreeSet::from([0]);
-        app.selection_anchor = Some(0);
+        let mut app = PdfCompressorApp {
+            files: vec![make_test_item("one.pdf", 2_000_000)],
+            selected_indices: BTreeSet::from([0]),
+            selection_anchor: Some(0),
+            ..Default::default()
+        };
 
-        let _ = run_frame(&ctx, &mut app, DEFAULT_WINDOW_WIDTH, 700.0);
+        let _ = run_frame(&ctx, &mut app, ACTIVE_DEFAULT_WINDOW_WIDTH, 700.0);
         let jpeg_h = app.last_fitted_height.unwrap();
 
         app.files[0].settings.options.format = ImageFormatChoice::Jpeg2000;
-        let _ = run_frame(&ctx, &mut app, DEFAULT_WINDOW_WIDTH, 700.0);
+        let _ = run_frame(&ctx, &mut app, ACTIVE_DEFAULT_WINDOW_WIDTH, 700.0);
         let jpx_h = app.last_fitted_height.unwrap();
 
         app.files[0].settings.options.format = ImageFormatChoice::Png;
-        let _ = run_frame(&ctx, &mut app, DEFAULT_WINDOW_WIDTH, 700.0);
+        let _ = run_frame(&ctx, &mut app, ACTIVE_DEFAULT_WINDOW_WIDTH, 700.0);
         let png_h = app.last_fitted_height.unwrap();
 
         assert!((jpeg_h - jpx_h).abs() < 1.0);
@@ -2962,12 +4542,13 @@ mod tests {
 
         // Over-target single summary card renders only badge + red highlight (zero warning banner text height).
         let ctx = egui::Context::default();
-        app.files[0].result = Some(under);
-        let _ = run_frame(&ctx, &mut app, DEFAULT_WINDOW_WIDTH, 700.0);
+        app.show_preview = true;
+        app.files[0].result = Some(Box::new(under));
+        let _ = run_frame(&ctx, &mut app, ACTIVE_DEFAULT_WINDOW_WIDTH, 700.0);
         let under_h = app.last_fitted_height.unwrap();
 
-        app.files[0].result = Some(over);
-        let _ = run_frame(&ctx, &mut app, DEFAULT_WINDOW_WIDTH, 700.0);
+        app.files[0].result = Some(Box::new(over));
+        let _ = run_frame(&ctx, &mut app, ACTIVE_DEFAULT_WINDOW_WIDTH, 700.0);
         let over_h = app.last_fitted_height.unwrap();
         assert!(
             (under_h - over_h).abs() < 1.0,
@@ -2975,11 +4556,11 @@ mod tests {
         );
         app.files[0].result = None;
 
-        // Percent mode UI renders cleanly at MIN_WINDOW_WIDTH without horizontal overflow
-        let _ = run_frame(&ctx, &mut app, MIN_WINDOW_WIDTH, 700.0);
+        // Percent mode UI renders cleanly at ACTIVE_MIN_WINDOW_WIDTH without horizontal overflow
+        let _ = run_frame(&ctx, &mut app, ACTIVE_MIN_WINDOW_WIDTH, 700.0);
         assert!(
             app.last_content_width <= MIN_WINDOW_WIDTH - 20.0 + 0.5,
-            "Percent mode UI overflowed {MIN_WINDOW_WIDTH}px width: {}px",
+            "Percent mode UI overflowed {MIN_WINDOW_WIDTH}px central width: {}px",
             app.last_content_width
         );
     }
@@ -3179,7 +4760,7 @@ mod tests {
         app.files[0].settings.target_mode = TargetMode::Off;
         app.files[0].settings.options.scale = 0.57;
         let ctx = egui::Context::default();
-        let _ = run_frame(&ctx, &mut app, DEFAULT_WINDOW_WIDTH, 700.0);
+        let _ = run_frame(&ctx, &mut app, ACTIVE_DEFAULT_WINDOW_WIDTH, 700.0);
         assert!((app.files[0].settings.options.scale - 0.57).abs() < 1e-6);
     }
 
@@ -3321,14 +4902,27 @@ mod tests {
     #[test]
     fn summary_header_progress_counter_and_slider_alignment_render_cleanly() {
         let ctx = egui::Context::default();
-        let mut app = PdfCompressorApp::default();
-        app.files = vec![make_test_item("single.pdf", 4_000_000)];
-        app.selected_indices.insert(0);
-        app.selection_anchor = Some(0);
+        let mut app = PdfCompressorApp {
+            show_preview: true,
+            files: vec![make_test_item("single.pdf", 4_000_000)],
+            selected_indices: BTreeSet::from([0]),
+            selection_anchor: Some(0),
+            ..Default::default()
+        };
 
-        // Two frames let egui::Grid settle its shared column width cleanly at MIN_WINDOW_WIDTH.
-        let _ = run_frame(&ctx, &mut app, MIN_WINDOW_WIDTH, DEFAULT_WINDOW_HEIGHT);
-        let _ = run_frame(&ctx, &mut app, MIN_WINDOW_WIDTH, DEFAULT_WINDOW_HEIGHT);
+        // Two frames let egui::Grid settle its shared column width cleanly at ACTIVE_MIN_WINDOW_WIDTH.
+        let _ = run_frame(
+            &ctx,
+            &mut app,
+            ACTIVE_MIN_WINDOW_WIDTH,
+            MIN_PREVIEW_WINDOW_HEIGHT,
+        );
+        let _ = run_frame(
+            &ctx,
+            &mut app,
+            ACTIVE_MIN_WINDOW_WIDTH,
+            MIN_PREVIEW_WINDOW_HEIGHT,
+        );
 
         let q_slider = app.last_quality_slider_rect.expect("quality slider rect");
         let s_slider = app.last_scale_slider_rect.expect("scale slider rect");
@@ -3341,6 +4935,23 @@ mod tests {
                 && (q_drag.width() - s_drag.width()).abs() < 0.5,
             "sliders and value boxes should align identically: q={q_slider:?}/{q_drag:?}, s={s_slider:?}/{s_drag:?}"
         );
+
+        // Switching Target Size to Megabytes must NOT shift or resize the sliders.
+        app.files[0].settings.target_mode = TargetMode::Megabytes;
+        let _ = run_frame(
+            &ctx,
+            &mut app,
+            ACTIVE_MIN_WINDOW_WIDTH,
+            MIN_PREVIEW_WINDOW_HEIGHT,
+        );
+        let q_slider_mb = app.last_quality_slider_rect.expect("q slider mb");
+        let q_drag_mb = app.last_quality_drag_rect.expect("q drag mb");
+        assert!(
+            (q_slider_mb.min.x - q_slider.min.x).abs() < 0.5
+                && (q_slider_mb.width() - q_slider.width()).abs() < 0.5
+                && (q_drag_mb.width() - q_drag.width()).abs() < 0.5,
+            "sliders must stay fixed when Target Size mode changes: off={q_slider:?}, mb={q_slider_mb:?}"
+        );
         assert!(app.last_content_width <= MIN_WINDOW_WIDTH - 20.0 + 0.5);
 
         // Busy state renders cleanly with compact progress counter (single 1/1 and batch 2/3)
@@ -3350,7 +4961,12 @@ mod tests {
             current: 1,
             total: 1,
         });
-        let _ = run_frame(&ctx, &mut app, MIN_WINDOW_WIDTH, DEFAULT_WINDOW_HEIGHT);
+        let _ = run_frame(
+            &ctx,
+            &mut app,
+            ACTIVE_MIN_WINDOW_WIDTH,
+            MIN_PREVIEW_WINDOW_HEIGHT,
+        );
         assert!(app.is_busy());
 
         app.files = vec![
@@ -3362,12 +4978,257 @@ mod tests {
             current: 2,
             total: 3,
         });
-        let _ = run_frame(&ctx, &mut app, MIN_WINDOW_WIDTH, 700.0);
+        let _ = run_frame(&ctx, &mut app, ACTIVE_MIN_WINDOW_WIDTH, 700.0);
         assert!(app.is_busy());
 
         app.worker_rx = None;
         app.progress = None;
-        let _ = run_frame(&ctx, &mut app, MIN_WINDOW_WIDTH, 700.0);
+        let _ = run_frame(&ctx, &mut app, ACTIVE_MIN_WINDOW_WIDTH, 700.0);
         assert!(!app.is_busy());
+    }
+
+    #[test]
+    fn preview_panel_visibility_page_eviction_and_clear_behave_cleanly() {
+        use image::{DynamicImage, ImageBuffer, Rgb};
+        use lopdf::{dictionary, Document, Object, Stream};
+
+        fn build_two_page_preview_pdf() -> Vec<u8> {
+            let mut doc = Document::with_version("1.5");
+            let pages_id = doc.new_object_id();
+
+            let img1 = DynamicImage::ImageRgb8(ImageBuffer::from_fn(24, 24, |x, y| {
+                Rgb([(x * 10) as u8, (y * 10) as u8, 180])
+            }));
+            let raw1 = img1.to_rgb8().into_raw();
+            let img1_id = doc.add_object(Stream::new(
+                dictionary! {
+                    "Type" => "XObject",
+                    "Subtype" => "Image",
+                    "Width" => 24,
+                    "Height" => 24,
+                    "ColorSpace" => "DeviceRGB",
+                    "BitsPerComponent" => 8,
+                },
+                raw1,
+            ));
+
+            let content1_id = doc.add_object(Stream::new(
+                dictionary! {},
+                b"q 24 0 0 24 0 0 cm /Im1 Do Q".to_vec(),
+            ));
+            let page1_id = doc.add_object(dictionary! {
+                "Type" => "Page",
+                "Parent" => pages_id,
+                "MediaBox" => vec![0.into(), 0.into(), 200.into(), 200.into()],
+                "Resources" => dictionary! {
+                    "XObject" => dictionary! { "Im1" => img1_id },
+                },
+                "Contents" => content1_id,
+            });
+            let content2_id = doc.add_object(Stream::new(
+                dictionary! {},
+                b"0.15 0.15 0.15 rg 20 20 80 80 re f".to_vec(),
+            ));
+            let page2_id = doc.add_object(dictionary! {
+                "Type" => "Page",
+                "Parent" => pages_id,
+                "MediaBox" => vec![0.into(), 0.into(), 200.into(), 200.into()],
+                "Contents" => content2_id,
+            });
+            doc.objects.insert(
+                pages_id,
+                Object::Dictionary(dictionary! {
+                    "Type" => "Pages",
+                    "Kids" => vec![page1_id.into(), page2_id.into()],
+                    "Count" => 2,
+                }),
+            );
+            let catalog_id = doc.add_object(dictionary! {
+                "Type" => "Catalog",
+                "Pages" => pages_id,
+            });
+            doc.trailer.set("Root", catalog_id);
+            let mut out = Vec::new();
+            doc.save_to(&mut out).unwrap();
+            out
+        }
+
+        let ctx = egui::Context::default();
+        let mut app = PdfCompressorApp::default();
+        assert!(!app.show_preview, "Show Preview must default to unchecked");
+        assert_eq!(app.preview_framing, PreviewFraming::Fit);
+
+        // Empty state hides preview panel completely.
+        let _ = run_frame(&ctx, &mut app, DEFAULT_WINDOW_WIDTH, DEFAULT_WINDOW_HEIGHT);
+        assert!(!app.preview_panel_open);
+        assert!(app.preview_display.is_none());
+
+        // Loading a 2-page PDF keeps preview panel hidden until user checks "Show Preview".
+        let pdf_bytes = build_two_page_preview_pdf();
+        app.load_pdf_inputs(vec![(None, "two_page.pdf".to_string(), pdf_bytes)], vec![]);
+        let _ = run_frame(&ctx, &mut app, DEFAULT_WINDOW_WIDTH, DEFAULT_WINDOW_HEIGHT);
+        assert!(!app.preview_panel_open);
+        assert!(app.preview_display.is_none());
+
+        // Checking "Show Preview" opens preview panel and loads full-page Page 1 preview (200pt * 2.0 = 400px).
+        app.show_preview = true;
+        let _ = run_frame(
+            &ctx,
+            &mut app,
+            ACTIVE_DEFAULT_WINDOW_WIDTH,
+            MIN_PREVIEW_WINDOW_HEIGHT,
+        );
+        assert!(app.preview_panel_open);
+        for _ in 0..40 {
+            let _ = run_frame(
+                &ctx,
+                &mut app,
+                ACTIVE_DEFAULT_WINDOW_WIDTH,
+                MIN_PREVIEW_WINDOW_HEIGHT,
+            );
+            if app.preview_display.is_some() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        let page1_display = app
+            .preview_display
+            .as_ref()
+            .expect("page 1 preview should finish loading");
+        assert!(!page1_display.synthetic_empty);
+        assert_eq!((page1_display.orig_width, page1_display.orig_height), (400, 400));
+        assert!(page1_display.orig_texture.is_some());
+
+        // Unchecking "Show Preview" hides side panel and evicts preview textures immediately.
+        app.show_preview = false;
+        let _ = run_frame(&ctx, &mut app, DEFAULT_WINDOW_WIDTH, MIN_PREVIEW_WINDOW_HEIGHT);
+        assert!(!app.preview_panel_open);
+        assert!(app.preview_display.is_none());
+
+        // Re-checking "Show Preview" restores the side panel and verifies capsule page edit clamping.
+        app.show_preview = true;
+        app.preview_page_edit_buf = "99".to_string();
+        app.commit_preview_page_edit(2);
+        assert_eq!(app.preview_page, 2);
+        app.preview_page = 1;
+        app.preview_page_edit_buf = "1".to_string();
+        let _ = run_frame(
+            &ctx,
+            &mut app,
+            ACTIVE_DEFAULT_WINDOW_WIDTH,
+            MIN_PREVIEW_WINDOW_HEIGHT,
+        );
+        assert!(app.preview_panel_open);
+
+        // Switching to Page 2 (vector-only) immediately evicts Page 1 textures and renders Page 2 full page.
+        app.preview_page = 2;
+        app.sync_preview_selection_and_poll(&ctx);
+        assert!(
+            app.preview_display.is_none(),
+            "previous page textures must be evicted immediately on page change"
+        );
+        for _ in 0..40 {
+            let _ = run_frame(
+                &ctx,
+                &mut app,
+                ACTIVE_DEFAULT_WINDOW_WIDTH,
+                MIN_PREVIEW_WINDOW_HEIGHT,
+            );
+            if app.preview_display.is_some() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        let page2_display = app
+            .preview_display
+            .as_ref()
+            .expect("page 2 vector full-page preview should load");
+        assert!(!page2_display.synthetic_empty);
+        assert_eq!((page2_display.orig_width, page2_display.orig_height), (400, 400));
+        assert!(page2_display.orig_texture.is_some());
+
+        // Verify framing cycle Fit -> Fill -> Center -> Fit and clamped custom zoom input (10%..=500%).
+        assert_eq!(app.preview_framing.next(), PreviewFraming::Fill);
+        assert_eq!(PreviewFraming::Fill.next(), PreviewFraming::Center);
+        assert_eq!(PreviewFraming::Center.next(), PreviewFraming::Fit);
+
+        app.preview_zoom_edit_buf = "750".to_string();
+        app.commit_preview_zoom_edit();
+        assert_eq!(app.active_preview_view_mode(), PreviewViewMode::FixedZoomPct(500));
+
+        app.preview_zoom_edit_buf = "4%".to_string();
+        app.commit_preview_zoom_edit();
+        assert_eq!(app.active_preview_view_mode(), PreviewViewMode::FixedZoomPct(10));
+
+        app.preview_fixed_zoom = false;
+        app.preview_framing = PreviewFraming::Fill;
+        let _ = run_frame(
+            &ctx,
+            &mut app,
+            ACTIVE_DEFAULT_WINDOW_WIDTH,
+            MIN_PREVIEW_WINDOW_HEIGHT,
+        );
+        app.preview_framing = PreviewFraming::Center;
+        let _ = run_frame(
+            &ctx,
+            &mut app,
+            ACTIVE_DEFAULT_WINDOW_WIDTH,
+            MIN_PREVIEW_WINDOW_HEIGHT,
+        );
+        app.preview_show_original_held = true;
+        let _ = run_frame(
+            &ctx,
+            &mut app,
+            ACTIVE_DEFAULT_WINDOW_WIDTH,
+            MIN_PREVIEW_WINDOW_HEIGHT,
+        );
+        assert!(!app.preview_show_original_held);
+
+        // Clearing files drops textures and collapses the preview panel.
+        app.clear_files();
+        assert!(app.preview_display.is_none());
+        let _ = run_frame(&ctx, &mut app, DEFAULT_WINDOW_WIDTH, DEFAULT_WINDOW_HEIGHT);
+        assert!(!app.preview_panel_open);
+
+        // Changing Color-depth updates PreviewKey, estimates, and auto-falls back on format switch.
+        let mut cd_app = PdfCompressorApp::default();
+        cd_app.files.push(PdfCompressorApp::build_loaded_item(
+            None,
+            "depth.pdf".to_string(),
+            None,
+            PdfSummary::synthetic_for_test(2, 4_000_000, 120_000, 4, 1000, 800_000, false),
+        ));
+        cd_app.selected_indices.insert(0);
+        assert_eq!(cd_app.files[0].settings.options.color_depth, ColorDepth::TrueColor24);
+
+        let est_24 = cd_app.files[0].cached_estimated_bytes;
+        let mut draft = cd_app.files[0].settings.clone();
+        draft.options.format = ImageFormatChoice::Jpeg2000;
+        draft.options.color_depth = ColorDepth::Hdr30;
+        cd_app.apply_settings_delta(
+            &draft,
+            SettingsDelta {
+                format_changed: true,
+                color_depth_changed: true,
+                ..Default::default()
+            },
+        );
+        assert_eq!(cd_app.files[0].settings.options.color_depth, ColorDepth::Hdr30);
+        assert_ne!(cd_app.files[0].cached_estimated_bytes, est_24);
+
+        let mut switch_back = cd_app.files[0].settings.clone();
+        switch_back.options.format = ImageFormatChoice::Jpeg;
+        cd_app.apply_settings_delta(
+            &switch_back,
+            SettingsDelta {
+                format_changed: true,
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            cd_app.files[0].settings.options.color_depth,
+            ColorDepth::TrueColor24,
+            "switching from JPEG 2000 HDR 30-bit to JPG must auto-fallback to True Color (24-bit)"
+        );
     }
 }

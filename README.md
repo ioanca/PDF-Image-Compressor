@@ -1,120 +1,123 @@
 # PDF Image Compressor
 
-A fast, lightweight desktop GUI application written in Rust for compressing PDF files containing scanned pages, documents, or photos while preserving physical page dimensions (`/MediaBox`, `/CropBox`) and visual layout (`cm` transformation matrices).
+A fast, lightweight, single-executable desktop GUI application written in Rust for compressing PDF files containing scanned pages, documents, or photos while preserving physical page dimensions (`/MediaBox`, `/CropBox`) and visual layout (`cm` transformation matrices).
 
-It features a native single-executable interface with single and batch PDF processing, live O(1) output size estimation, automatic target-size solving, multi-core image re-encoding (`JPG`, `JPEG 2000`, `PNG`), and lossless PDF structural optimization.
+Built with `eframe`/`egui` (`glow` OpenGL backend), `lopdf`, `hayro`, `mozjpeg`, `flate2` (`zlib-rs`), `rayon`, and `mimalloc`, it combines a unified single- and multi-file explorer interface, real-time empirical size estimation, automatic target-size solving, interactive full-page visual diff previews, and low-RAM structural PDF optimization.
 
-## Project Overview
+---
 
-The PDF Image Compressor is a desktop tool built to shrink bloated PDFs without distorting page geometry or breaking reader compatibility. The application parses unencrypted PDF documents in memory using `lopdf` and automatically:
+## Key Features
 
-- Inspects pages, embedded Image XObjects, and structural overhead upon file load
-- Estimates compressed file sizes in real time as format, quality, scale, or filter settings change
-- Solves optimal scale and quality settings to hit user-defined MB or percentage targets
-- Re-encodes embedded images across all CPU cores while leaving small icons, 1-bit scans, and bloated outputs untouched
-- Prunes unreachable objects, deduplicates identical streams, re-compresses `/FlateDecode` streams, and writes compact PDF 1.5+ object/XRef streams
+### Unified Single-File & Batch Interface
+- **Explorer-Style File Table:** Load one or more unencrypted `.pdf` files via **Select** (`rfd`) or drag-and-drop. Both single-file and multi-file sessions share the same unified interface with multi-row selection (`Click`, `Ctrl/Cmd+Click`, `Shift+Click`, `Ctrl/Cmd+A`), **Apply for ALL** (visible when `> 1` file is loaded, keeping **Show Preview** pinned at the exact same vertical position), **Show Preview**, and **Compress**.
+- **Clickable Estimation Column:** Click the `Est. (MB)` / `Est. (%)` table header to toggle between estimated output size in megabytes and percentage of original size.
+- **DPI-Aware Responsive Layout:** Main control panel locks to `27.5%` of logical monitor width (`42.5%` default preview pane when expanded), capping the top file list at 10 visible rows, hiding **Compression Summary** when no file is selected, scaling the summary table dynamically between 5 and 10 visible rows when `≥ 5` files are loaded, and enforcing a dynamic `MinInnerSize` matched to content height.
 
-### Key Features
+### Compression & Resize Settings
+- **Resize Filter:**
+  - `Fancy` (`Lanczos3`) for sharper downsampling
+  - `Fast` (`CatmullRom`) for faster resizing
+- **Image Format (PDF-Native Output Codecs):**
+  - **JPG (`/DCTDecode`):** Powered by MozJPEG (`mozjpeg`) with trellis quantization, progressive scan optimization, overshoot deringing, and adaptive `4:2:0` (`quality <= 85`) / `4:4:4` (`quality > 85`) chroma subsampling.
+  - **JPEG 2000 (`/JPXDecode`):** Pure-Rust ITU-T T.800 Part 1 encoder (`jpx_enc`) using Irreversible Color Transform (ICT), CDF 9/7 DWT, and EBCOT arithmetic coding.
+  - **PNG (`/FlateDecode`):** Lossless encoding using adaptive PNG row filtering (PDF `/Predictor 15`) with raw zlib fallback and 1-bit bi-level packing.
+- **Format-Adaptive Color Depth:** Automatically filters available options to those supported by the active format (falling back cleanly when switching codecs):
+  - `Black/White (1-bit)` — `JPEG 2000`, `PNG`
+  - `Grayscale (8-bit)` — `JPG`, `JPEG 2000`, `PNG`
+  - `High Color (16-bit)` — `JPEG 2000`, `PNG` (RGB565 quantization)
+  - `True Color (24-bit)` — `JPG`, `JPEG 2000`, `PNG`
+  - `HDR (30-bit)` — `JPEG 2000` (10-bit-per-channel encoding)
+- **Name Suffix:** Customize the output filename suffix (defaults to `-compressed`; leave blank for safe atomic in-place overwrite).
+- **Quality Factor (`1–100`) & Resolution Scale (`0.10–1.00`):** Fine-grained `0.01` resolution scaling with instant O(1) empirical size estimation.
+- **3-State Target Size Solver:** Cycles between `Target Size` (`Off`, showing inline `Estimated Size`), `Target Size (MB):`, and `Target Size (%):`, automatically solving `Resolution Scale` first (`1.00` down to `0.10`) and then `Quality Factor` (`100` down to `1`) on lossy formats.
 
-- **Native GUI & Drag-and-Drop**: Built with `eframe`/`egui` and `rfd` (`Select PDF` supports single or multi-file selection, alongside drag-and-drop for `.pdf` files)
-- **Three PDF-Native Output Codecs**:
-  - **JPG (`/DCTDecode`)**: Powered by MozJPEG (`mozjpeg`) with trellis quantization, progressive scan optimization, overshoot deringing, and adaptive `4:2:0` (`quality <= 85`) / `4:4:4` (`quality > 85`) chroma subsampling
-  - **JPEG 2000 (`/JPXDecode`)**: Built-in ITU-T T.800 Part 1 encoder (`jpx_enc`) using Irreversible Color Transform (ICT), CDF 9/7 DWT, and EBCOT arithmetic coding
-  - **PNG (`/FlateDecode`)**: Lossless encoding with adaptive PNG row filtering (PDF `/Predictor 15`) and zlib fallback
-- **Batch Processing & Multi-Selection**: Load multiple PDFs into an interactive table (`Click`, `Ctrl/Cmd+Click`, `Shift+Click`, `Ctrl/Cmd+A`), toggle `Est. (MB)` / `Est. (%)` previews, configure files individually or via `Apply for ALL`, and export to a chosen folder
-- **3-State Target Size Solver**: Cycles between `Target Size` (off, showing inline `Estimated Size`), `Target Size (MB):`, and `Target Size (%):`, automatically adjusting resolution scale and quality factor
-- **Multi-Codec Input Decoding**: Decodes `/DCTDecode`, `/JPXDecode` (`hayro-jpeg2000`), `/JBIG2Decode` (`hayro-jbig2`), `/CCITTFaxDecode` (`hayro-ccitt`), and raw/deflated streams across `/DeviceGray`, `/DeviceRGB`, `/DeviceCMYK`, `/CalGray`, `/CalRGB`, `/ICCBased`, and `/Indexed` color spaces
-- **Structural Optimization & Anti-Bloat Guards**: Performs unreachable-object garbage collection, iterative stream/object deduplication, `/FlateDecode` level-9 re-compression of non-image streams, and PDF 1.5+ `/ObjStm` + binary `/XRef` packing
+### Interactive Full-Page Visual Diff Preview
+- **Real-Time Full-Page Rasterization:** Powered by `hayro`, displaying the full composed page (vector text, graphics, and re-encoded images) rather than isolated image streams.
+- **Three-Zone Header Toolbar:**
+  - **Left:** `Page Preview` title and live rendering spinner.
+  - **Center:** Dynamically centered `<  [ X / Y ]  >` page navigation capsule with inline editable page jump.
+  - **Right:** Right-aligned `[100%]   [Fit]   [Original]` controls — fixed `58 × 22 px` inline-editable custom zoom pill (`10%–500%`), `Fit` / `Fill` / `Center` framing cycle, and a **press-and-hold `Original`** button that instantaneously flips to the uncompressed original page texture at the exact same zoom level and scroll offset.
+- **Instant Navigation Gestures:** Zero-animation, cursor-centered trackpad pinch-to-zoom and `Ctrl + Scrollwheel` zooming (`10%–500%`), plus left-click drag panning (`Grab` / `Grabbing` cursors).
+
+---
+
+## Optimization Pipeline & Low-End Hardware Architecture
+
+### Multi-Codec Input Decoding
+Decodes `/DCTDecode`, `/JPXDecode` (`hayro-jpeg2000`), `/JBIG2Decode` (`hayro-jbig2`), `/CCITTFaxDecode` (`hayro-ccitt`), and raw/deflated streams across `/DeviceGray`, `/DeviceRGB`, `/DeviceCMYK`, `/CalGray`, `/CalRGB`, `/ICCBased`, and `/Indexed` color spaces.
+
+### Structural Optimization & Anti-Bloat Pipeline
+1. **Reachability Garbage Collection:** Prunes orphaned incremental-save objects unreachable from `/Root` and `/Info`.
+2. **Iterative Object Deduplication:** Uses fast 128-bit structural hashing (`FastHasher128`) to merge duplicate streams and dictionaries before image processing so repeated images are encoded only once.
+3. **MRC & 1-Bit Preservation:** Automatically passes through 1-bit bi-level CCITT/JBIG2 streams and tiny icons (`< 50×50` px) untouched; preserves Mixed Raster Content (MRC) `/SMask` streams by scaling 8-bit soft masks losslessly alongside their parent image while keeping 1-bit stencil `/Mask` streams intact.
+4. **Per-Stream Size-Bloat Guard:** Retains original image streams whenever re-encoding at `True Color (24-bit)` does not reduce byte size, and passes single-filter `/DCTDecode` streams straight through at `JPG Q100` / `1.00` scale.
+5. **Auxiliary Flate Recompression & Modern Container Packing:** Recompresses non-image `/FlateDecode` and raw streams at zlib level 9 (`zlib-rs`) with reusable scratch buffers and writes compact PDF 1.5+ `/ObjStm` Object Streams and binary `/XRef` Cross-Reference Streams (`save_modern`).
+
+### Low-RAM & Low-Level Systems Optimizations
+- **Bounded Memory Footprint (`< 150 MB` Peak RAM):** Processes images in bounded chunks sized to worker concurrency, immediately applying encoded streams in place and dropping decoded pixel buffers between chunks; caches only the single active previewed page.
+- **Non-Intrusive Background Threading:** Dedicated `rayon` worker pool capped to `50%` of logical cores (`1..=4` threads) running at **Below Normal** OS thread priority so the desktop UI stays responsive on low-core machines.
+- **Systems & Compiler Tuning:**
+  - `mimalloc` global allocator (`#[global_allocator]`) for fast multi-threaded image allocations and lower heap fragmentation.
+  - Boxed large enum/event payloads, SoA numeric batch metrics (`BatchHotMetrics`), `SmallVec` stack-allocated PDF filter/decode chains, `Cow<'a, [u8]>` zero-copy stream borrowing, and non-generic inner delegation to prevent monomorphization bloat.
+  - Static chunk slicing (`as_chunks` / `as_chunks_mut`), pre-computed LUTs, and native SIMD code generation (`-C target-cpu=native` in `.cargo/config.toml`).
+
+---
 
 ## System Requirements
 
-- **Rust**: Stable Rust toolchain ([rustup.rs](https://rustup.rs/)) with Cargo (for building from source)
-- **Windows GNU Toolchain (optional)**: MinGW-w64 (`gcc`, `ar`, `dlltool`) if targeting `x86_64-pc-windows-gnu` as configured in `.cargo/config.toml`
-- **Core Rust Crates** (managed via `Cargo.lock`): `eframe`/`egui`, `rfd`, `lopdf`, `image`, `mozjpeg`, `flate2`, `rayon`, `sha2`, `thiserror`, `hayro-ccitt`, `hayro-jbig2`, and `hayro-jpeg2000`
-- **No External Runtime Dependencies**: Compiles to a standalone native executable
+- **Rust:** Stable Rust toolchain ([rustup.rs](https://rustup.rs/)) with Cargo (for building from source).
+- **No External Runtime Dependencies:** Compiles to a standalone native executable.
 
-## Installation & Setup
+---
 
-1. **Navigate to the project directory:**
+## Build & Run Instructions
 
-2. **Build the standalone release executable:**
+1. **Build the optimized release executable:**
    ```powershell
    cargo build --release
    ```
+   The `[profile.release]` configuration enables `opt-level = 3`, `lto = "fat"`, `codegen-units = 1`, `strip = true`, and the `mimalloc` global allocator. `.cargo/config.toml` also enables `-C target-cpu=native` for local AVX2/SSE4.2 SIMD acceleration (remove that flag if distributing the compiled binary to older CPUs).
 
-3. **Run the application:**
+2. **Run directly with Cargo:**
    ```powershell
    cargo run --release
    ```
-   Or launch the compiled binary directly:
+
+3. **Or launch the compiled binary directly:**
    - **Windows:** `target\release\pdf-compressor.exe`
    - **macOS / Linux:** `target/release/pdf-compressor`
 
-This will open the **PDF Image Compressor** desktop window.
-
-## Usage
-
-1. Launch the application (`cargo run --release` or `pdf-compressor.exe`).
-2. Load one or more unencrypted `.pdf` files using **Select PDF** or by dragging and dropping files onto the window.
-3. Configure **Compression & Resize Settings** (in multi-file mode, select specific rows or enable **Apply for ALL**):
-   - **Image Format**: Choose `JPG`, `JPEG 2000`, or `PNG` (lossless; disables **Quality Factor**)
-   - **Quality Factor**: Adjust `1..=100` for `JPG` and `JPEG 2000`
-   - **Resolution Scale**: Adjust `0.10x..=1.00x` to downscale image pixel dimensions
-   - **Resize Filter**: Choose `Fancy` (`Lanczos3`) or `Fast` (`CatmullRom`)
-   - **Target Size**: Click the checkbox to cycle `Off` → `Target Size (MB):` → `Target Size (%):`
-4. Click **Compress & Save**:
-   - **Single-file mode**: Choose an output file via **Save As** (defaults to `<name>_compressed.pdf`). The **Compression Summary** card displays **Original Size**, **New Size**, **Space Saved**, and a **COMPRESSED**, **UNDER TARGET**, or **OVER TARGET** badge.
-   - **Batch mode**: Choose an output folder to save `<name>_compressed.pdf` (automatically appending `_2`, `_3`, etc. on name collisions). The summary table highlights each row (`Failed`, over target, or under target) and displays the output folder path.
+4. **Run the verification suite:**
+   ```powershell
+   cargo check --all-targets
+   cargo clippy --all-targets -- -W clippy::all -D warnings
+   cargo test
+   ```
 
 > **Note:** Password-protected / encrypted PDFs cannot be unlocked automatically and will report an error upon loading or compression.
 
-## Base Functionality
+---
 
-### Overview
-When PDFs are loaded, `inspect_pdf` parses each document in a background worker thread, runs structural garbage collection and deduplication in memory, and builds a `PdfSummary` without modifying the source files on disk.
-
-The UI adapts dynamically between single-file and multi-file layouts, auto-fitting window height while keeping controls responsive during background inspection and compression via channel-based worker events (`WorkerEvent`).
-
-## Compression & Target-Size Engine
-
-### Overview
-The compression pipeline combines fast analytical size estimation with parallel image re-encoding and PDF container compaction.
-
-### How It Works
-
-#### 1. **Bitrate Calibration & O(1) Size Estimation**
-- During `inspect_pdf`, the largest compressible image (downscaled to at most ~1 MP if needed) is sampled to calibrate actual `JPG` (at Q50) and `FlateDecode` bytes-per-pixel rates
-- Combines calibrated pixel bitrates with structural baselines (`ObjStm`/`XRef` compression factors and `/FlateDecode` stream estimates) so dragging any slider updates **Estimated Size** instantaneously
-
-#### 2. **Target-Size Solver (`scale` First, Then `quality`)**
-- When **Target Size (MB)** or **Target Size (%)** is active, `apply_target_scale_first` searches `scale` from `1.00x` down to `0.10x` to find the highest resolution that fits the byte budget
-- If `scale` reaches `0.10x` while still over budget—or stays at `1.00x` with spare budget—on a lossy format (`JPG` or `JPEG 2000`), `solve_quality_for_target` searches `quality` (`100` down to `1`) to meet the target
-- Adjusting **Quality Factor** manually re-solves **Resolution Scale**, and adjusting **Resolution Scale** manually re-solves **Quality Factor**
-
-#### 3. **Parallel Image Processing & PDF Serialization**
-- **Candidate Filtering**: Skips 1-bit bi-level images, images smaller than `50x50` px, and explicit chroma-key `/Mask` arrays; passes through single-filter `/DCTDecode` streams unchanged when `JPG` is set to `Q100` at `1.00x`
-- **Mask Handling**: Scales 8-bit `/SMask` alpha streams losslessly alongside their parent image when `scale < 1.0`, while keeping 1-bit `/SMask` and stencil `/Mask` streams intact
-- **Anti-Bloat & Container Packing**: Decodes, resizes, and re-encodes images in parallel with `rayon`, retains original image streams whenever re-encoding is not smaller, re-compresses auxiliary `/FlateDecode` streams at level 9, runs post-compression GC, and writes PDF 1.5+ object and binary `/XRef` streams
-
-### File Structure
+## File Structure
 
 ```text
-main/
+PDF-Image-Compressor-main/
 ├── .cargo/
-│   └── config.toml         # Windows GNU MinGW linker & mozjpeg-sys CFLAGS config
+│   └── config.toml         # Native CPU SIMD rustflags (-C target-cpu=native)
 ├── src/
-│   ├── main.rs             # Application entry point & eframe viewport setup
-│   ├── app.rs              # egui/eframe UI, batch selection, target-size controls & workers
-│   ├── pdf_processor.rs    # PDF inspection, GC/dedup, codec decoding, estimator & compression
+│   ├── main.rs             # Entry point, mimalloc global allocator & eframe viewport setup
+│   ├── app.rs              # egui/eframe UI, unified file table, preview toolbar/zoom/pan & workers
+│   ├── pdf_processor.rs    # PDF inspection, GC/dedup, codec decoding, estimator, preview & compression
 │   ├── jpeg_enc.rs         # MozJPEG encoder/decoder (trellis, progressive, CMYK->RGB)
-│   └── jpx_enc.rs          # Pure-Rust ITU-T T.800 JPEG 2000 Part 1 encoder (/JPXDecode)
-├── Cargo.lock              # Locked dependency graph for pdf-compressor v0.1.0
+│   └── jpx_enc.rs          # Pure-Rust ITU-T T.800 JPEG 2000 Part 1 encoder (/JPXDecode, 1/8/10-bit)
+├── Cargo.toml              # Crate dependencies & fat-LTO release profile
+├── Cargo.lock              # Locked dependency graph
 └── README.md               # Project documentation
 ```
 
-### Future Improvements
+---
 
-1. **Optional Encryption & Metadata Controls**: Add user-password unlocking prompts and optional stripping/editing of document metadata (`/Info` and XMP).
-2. **Per-Page Preview & Visual Diff**: Render side-by-side page thumbnails comparing original vs. compressed image quality before saving.
-3. **Support for standalone photos**: The app currently supports exclusively PDFs. I intend too add support for images (maybe even other formats like .doc and .xls).
-4.  **Color management**: The ability to change the depth/color mode of the photos (grayscale, cmyk, rgb, 1/4/8/16 bit) through a separate options tab.
+## Future Improvements
+
+1. **Optional Encryption & Metadata Controls:** Add user-password unlocking prompts and optional stripping/editing of document metadata (`/Info` and XMP).
+2. **Standalone Image & Document Support:** Extend beyond PDFs to support compressing standalone image files and additional document formats.
