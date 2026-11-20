@@ -1101,7 +1101,8 @@ impl PdfCompressorApp {
                 };
 
                 let outcome = compressed.and_then(|(out_bytes, stats)| {
-                    let write_res = write_pdf_bytes_safely(&job.output_path, &out_bytes);
+                    let write_res =
+                        write_pdf_bytes_safely_indexed(&job.output_path, &out_bytes, job.index);
                     drop(out_bytes);
                     write_res?;
                     Ok(Box::new(CompressionResult::from_stats(
@@ -1895,7 +1896,12 @@ impl PdfCompressorApp {
         );
     }
 
-    fn render_summary_card(&mut self, ui: &mut egui::Ui) -> f32 {
+    fn render_summary_card(&mut self, ui: &mut egui::Ui, panel_bottom_y: f32) -> f32 {
+        const SUMMARY_FOOTER_HEIGHT: f32 = 22.0;
+        const SUMMARY_FOOTER_TOP_GAP: f32 = 6.0;
+        const SUMMARY_BOTTOM_RESERVE: f32 =
+            SUMMARY_FOOTER_TOP_GAP + SUMMARY_FOOTER_HEIGHT + 14.0 + 2.0;
+
         let dark = ui.visuals().dark_mode;
         let busy = self.is_busy();
         let mut clear_clicked = false;
@@ -1947,14 +1953,31 @@ impl PdfCompressorApp {
                 ui.add_space(3.0);
 
                 let file_count = self.files.len();
+                let monitor_height_pts = ui
+                    .ctx()
+                    .input(|i| i.viewport().monitor_size.map(|m| m.y))
+                    .filter(|h| h.is_finite() && *h > 0.0)
+                    .unwrap_or_else(|| 1080.0 / ui.ctx().pixels_per_point().max(1.0));
+                let display_max_rows = if monitor_height_pts <= 1100.0 {
+                    9
+                } else {
+                    SUMMARY_TABLE_MAX_VISIBLE_ROWS
+                };
+                let row_stride = TABLE_ROW_HEIGHT + TABLE_ROW_GAP;
+                let avail_rows_height =
+                    (panel_bottom_y - ui.cursor().top() - SUMMARY_BOTTOM_RESERVE).max(0.0);
+                let fitting_rows = (((avail_rows_height + TABLE_ROW_GAP) / row_stride)
+                    .floor()
+                    .max(1.0)) as usize;
+
                 let (scroll_h, auto_shrink_y) = if file_count < SUMMARY_TABLE_MIN_VISIBLE_ROWS {
                     (summary_rows_height(file_count), true)
                 } else {
+                    let max_summary_rows =
+                        fitting_rows.clamp(SUMMARY_TABLE_MIN_VISIBLE_ROWS, display_max_rows);
+                    let visible_summary_rows = file_count.min(max_summary_rows);
                     let min_scroll_h = summary_rows_height(SUMMARY_TABLE_MIN_VISIBLE_ROWS);
-                    let max_rows = file_count.min(SUMMARY_TABLE_MAX_VISIBLE_ROWS);
-                    let max_scroll_h = summary_rows_height(max_rows);
-                    let remaining_for_rows = (ui.clip_rect().max.y - ui.cursor().top() - 16.0).max(0.0);
-                    let target_h = remaining_for_rows.clamp(min_scroll_h, max_scroll_h);
+                    let target_h = summary_rows_height(visible_summary_rows);
                     extra_summary_h = (target_h - min_scroll_h).max(0.0);
                     (target_h, false)
                 };
@@ -1968,89 +1991,101 @@ impl PdfCompressorApp {
                     scroll_area = scroll_area.min_scrolled_height(scroll_h);
                 }
                 scroll_area.show(ui, |ui| {
-                        ui.spacing_mut().item_spacing.y = TABLE_ROW_GAP;
-                        let row_w = total_w.min(ui.available_width());
-                        let widths = summary_table_col_widths(row_w);
+                    ui.spacing_mut().item_spacing.y = TABLE_ROW_GAP;
+                    let row_w = total_w.min(ui.available_width());
+                    let widths = summary_table_col_widths(row_w);
 
-                        for (i, item) in self.files.iter().enumerate() {
-                            let (row_bg, row_text_color) = batch_row_colors(dark, item);
-                            let (row_rect, _) = ui.allocate_exact_size(
-                                egui::vec2(row_w, TABLE_ROW_HEIGHT),
-                                egui::Sense::hover(),
-                            );
+                    for (i, item) in self.files.iter().enumerate() {
+                        let (row_bg, row_text_color) = batch_row_colors(dark, item);
+                        let (row_rect, _) = ui.allocate_exact_size(
+                            egui::vec2(row_w, TABLE_ROW_HEIGHT),
+                            egui::Sense::hover(),
+                        );
 
-                            if row_bg != Color32::TRANSPARENT {
-                                ui.painter()
-                                    .rect_filled(row_rect, CornerRadius::same(4), row_bg);
-                            }
-
-                            let no_text = format!("{}", i + 1);
-                            let orig_text = format_mb_size(item.summary.file_bytes);
-
-                            let (new_text, saved_text, saved_color, saved_bold) =
-                                match (&item.result, &item.error) {
-                                    (Some(res), _) => (
-                                        format!("{:.2} MB", res.new_size_mb),
-                                        format_saved_pct(res.space_saved_pct),
-                                        row_text_color,
-                                        true,
-                                    ),
-                                    (None, Some(_err)) => {
-                                        ("Failed".to_string(), "-".to_string(), row_text_color, true)
-                                    }
-                                    (None, None) => {
-                                        let saved_s = match item.estimated_saved_percentage() {
-                                            Some(pct) => format_estimated_saved_pct(pct),
-                                            None => "-".to_string(),
-                                        };
-                                        (
-                                            "-".to_string(),
-                                            saved_s,
-                                            Some(ui.visuals().weak_text_color()),
-                                            false,
-                                        )
-                                    }
-                                };
-
-                            paint_row_cells(
-                                ui,
-                                row_rect,
-                                &TableRowCells {
-                                    widths,
-                                    aligns,
-                                    texts: [&no_text, &orig_text, &new_text, &saved_text],
-                                    colors: [
-                                        row_text_color,
-                                        row_text_color,
-                                        row_text_color,
-                                        saved_color,
-                                    ],
-                                    strong: [false, false, item.result.is_some(), saved_bold],
-                                    font_size: 12.5,
-                                    divider_stroke: guide_stroke,
-                                    divider_v_inset: 3.0,
-                                },
-                            );
+                        if row_bg != Color32::TRANSPARENT {
+                            ui.painter()
+                                .rect_filled(row_rect, CornerRadius::same(4), row_bg);
                         }
-                    });
 
-                if self.files.len() == 1 {
-                    if let Some(res) = self.files.first().and_then(|f| f.result.as_ref()) {
-                        ui.add_space(8.0);
-                        ui.label(
-                            RichText::new(format!("Saved to: {}", res.saved_path.display()))
-                                .size(11.5)
-                                .color(ui.visuals().weak_text_color()),
+                        let no_text = format!("{}", i + 1);
+                        let orig_text = format_mb_size(item.summary.file_bytes);
+
+                        let (new_text, saved_text, saved_color, saved_bold) =
+                            match (&item.result, &item.error) {
+                                (Some(res), _) => (
+                                    format!("{:.2} MB", res.new_size_mb),
+                                    format_saved_pct(res.space_saved_pct),
+                                    row_text_color,
+                                    true,
+                                ),
+                                (None, Some(_err)) => {
+                                    ("Failed".to_string(), "-".to_string(), row_text_color, true)
+                                }
+                                (None, None) => {
+                                    let saved_s = match item.estimated_saved_percentage() {
+                                        Some(pct) => format_estimated_saved_pct(pct),
+                                        None => "-".to_string(),
+                                    };
+                                    (
+                                        "-".to_string(),
+                                        saved_s,
+                                        Some(ui.visuals().weak_text_color()),
+                                        false,
+                                    )
+                                }
+                            };
+
+                        paint_row_cells(
+                            ui,
+                            row_rect,
+                            &TableRowCells {
+                                widths,
+                                aligns,
+                                texts: [&no_text, &orig_text, &new_text, &saved_text],
+                                colors: [
+                                    row_text_color,
+                                    row_text_color,
+                                    row_text_color,
+                                    saved_color,
+                                ],
+                                strong: [false, false, item.result.is_some(), saved_bold],
+                                font_size: 12.5,
+                                divider_stroke: guide_stroke,
+                                divider_v_inset: 3.0,
+                            },
                         );
                     }
-                } else if let Some(folder) = &self.batch_saved_folder {
-                    ui.add_space(8.0);
-                    ui.label(
-                        RichText::new(format!("Saved to: {}", folder.display()))
-                            .size(11.5)
-                            .color(ui.visuals().weak_text_color()),
-                    );
-                }
+                });
+
+                // Always reserve the fixed footer band for "Saved to: ..." so completing
+                // compression never shifts the card height or overflows the bottom window border.
+                ui.add_space(SUMMARY_FOOTER_TOP_GAP);
+                let saved_text: Option<String> = if self.files.len() == 1 {
+                    self.files
+                        .first()
+                        .and_then(|f| f.result.as_ref())
+                        .map(|res| format!("Saved to: {}", res.saved_path.display()))
+                } else {
+                    self.batch_saved_folder
+                        .as_ref()
+                        .map(|folder| format!("Saved to: {}", folder.display()))
+                };
+                ui.allocate_ui_with_layout(
+                    egui::vec2(ui.available_width(), SUMMARY_FOOTER_HEIGHT),
+                    egui::Layout::left_to_right(egui::Align::Center),
+                    |ui| {
+                        if let Some(text) = saved_text {
+                            ui.add(
+                                egui::Label::new(
+                                    RichText::new(text)
+                                        .size(11.5)
+                                        .color(ui.visuals().weak_text_color()),
+                                )
+                                .truncate(),
+                            );
+                        }
+                    },
+                );
             });
 
         if clear_clicked {
@@ -2977,7 +3012,8 @@ impl PdfCompressorApp {
             .resizable(false)
             .frame(panel_frame)
             .show(ui, |ui| {
-                egui::ScrollArea::vertical().show(ui, |ui| {
+                let panel_bottom_y = ui.max_rect().max.y;
+                let inner_resp = ui.vertical(|ui| {
                     self.render_file_card(ui, busy, is_hovered);
                     ui.add_space(10.0);
 
@@ -3024,11 +3060,16 @@ impl PdfCompressorApp {
 
                     if !self.files.is_empty() {
                         ui.add_space(10.0);
-                        self.render_summary_card(ui)
+                        self.render_summary_card(ui, panel_bottom_y)
                     } else {
                         0.0
                     }
-                })
+                });
+
+                let content_width = inner_resp.response.rect.width();
+                let content_height = inner_resp.response.rect.height();
+                let extra_summary_h = inner_resp.inner;
+                (content_width, content_height, extra_summary_h)
             });
 
         if show_preview {
@@ -3048,12 +3089,13 @@ impl PdfCompressorApp {
                 .show(ui, |_ui| {});
         }
 
+        let (content_width, content_height, extra_summary_h) = panel_resp.inner;
         #[cfg(test)]
         {
-            self.last_content_width = panel_resp.inner.content_size.x;
+            self.last_content_width = content_width;
         }
-        let content_height = panel_resp.inner.content_size.y;
-        let extra_summary_h = panel_resp.inner.inner;
+        #[cfg(not(test))]
+        let _ = content_width;
         let min_content_height = (content_height - extra_summary_h).max(0.0);
         let max_fit_h = ctx
             .input(|i| i.viewport().monitor_size.map(|m| (m.y - 80.0).max(360.0)))
@@ -3419,67 +3461,117 @@ fn recalculate_item_with_delta(item: &mut PdfFileItem, delta: Option<SettingsDel
     item.cached_estimated_bytes = item.summary.estimate_compressed_bytes(&item.settings.options);
 }
 
-fn item_output_stem(item: &PdfFileItem) -> String {
-    item.path
-        .as_deref()
-        .and_then(Path::file_stem)
-        .or_else(|| Path::new(&item.file_name).file_stem())
-        .map(|s| s.to_string_lossy().into_owned())
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| "document".to_string())
+fn sanitize_filename_suffix(raw_suffix: &str) -> String {
+    let cleaned: String = raw_suffix
+        .chars()
+        .filter(|&c| {
+            !c.is_control()
+                && !matches!(c, '\\' | '/' | ':' | '*' | '?' | '"' | '<' | '>' | '|')
+        })
+        .collect();
+    cleaned.trim_end_matches([' ', '.']).to_string()
 }
 
-fn formatted_output_filename(stem: &str, suffix: &str) -> String {
-    format!("{stem}{suffix}.pdf")
-}
-
-/// Writes `bytes` to `dest_path`. When overwriting an existing file (e.g., in-place when
-/// `suffix` is empty), writes to a sibling `.tmp` file first and atomically renames it over
-/// `dest_path` so Windows file locks never corrupt the target file.
-fn write_pdf_bytes_safely(dest_path: &Path, bytes: &[u8]) -> Result<(), String> {
-    if !dest_path.exists() {
-        return std::fs::write(dest_path, bytes)
-            .map_err(|e| format!("Failed to save {}: {e}", dest_path.display()));
-    }
-
-    let parent = dest_path.parent().unwrap_or_else(|| Path::new("."));
-    let stem = dest_path
+fn build_output_path(input_path: &Path, raw_suffix: &str) -> PathBuf {
+    let stem = input_path
         .file_stem()
         .and_then(|s| s.to_str())
         .filter(|s| !s.is_empty())
-        .unwrap_or("compressed");
+        .unwrap_or("output");
+    let sanitized = sanitize_filename_suffix(raw_suffix);
+    if sanitized.is_empty() {
+        input_path.with_file_name(format!("{stem}.pdf"))
+    } else {
+        input_path.with_file_name(format!("{stem}{sanitized}.pdf"))
+    }
+}
+
+fn is_file_locked_error(err: &std::io::Error) -> bool {
+    err.kind() == std::io::ErrorKind::PermissionDenied
+        || matches!(err.raw_os_error(), Some(5 | 32 | 33))
+}
+
+#[cold]
+fn format_file_save_error(dest_path: &Path, err: &std::io::Error) -> String {
+    if is_file_locked_error(err) {
+        format!("File is open in another program: {}", dest_path.display())
+    } else {
+        format!("Failed to save {}: {err}", dest_path.display())
+    }
+}
+
+#[cfg(test)]
+fn write_pdf_bytes_safely(dest_path: &Path, bytes: &[u8]) -> Result<(), String> {
+    write_pdf_bytes_safely_indexed(dest_path, bytes, 0)
+}
+
+/// Always writes `bytes` to a unique temporary file in the destination folder via `BufWriter`,
+/// flushes and drops all file handles, and atomically replaces `dest_path` so crashes or
+/// Windows file locks never corrupt the target PDF.
+fn write_pdf_bytes_safely_indexed(
+    dest_path: &Path,
+    bytes: &[u8],
+    job_index: usize,
+) -> Result<(), String> {
+    use std::io::{BufWriter, Write};
+
+    let parent = dest_path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
     let pid = std::process::id();
-    let mut tmp_path = parent.join(format!(".{stem}.{pid}.tmp"));
+    let mut tmp_path = parent.join(format!(".tmp_pdfcomp_{pid}_{job_index}.pdf"));
     let mut counter = 0usize;
     while tmp_path.exists() {
         counter += 1;
-        tmp_path = parent.join(format!(".{stem}.{pid}.{counter}.tmp"));
+        tmp_path = parent.join(format!(".tmp_pdfcomp_{pid}_{job_index}_{counter}.pdf"));
     }
 
     {
-        use std::io::Write;
-        let mut f = std::fs::File::create(&tmp_path)
-            .map_err(|e| format!("Failed to create temporary file {}: {e}", tmp_path.display()))?;
-        if let Err(e) = f.write_all(bytes).and_then(|_| f.sync_all()) {
-            drop(f);
+        let file = std::fs::File::create(&tmp_path)
+            .map_err(|e| format_file_save_error(&tmp_path, &e))?;
+        let mut writer = BufWriter::new(file);
+        if let Err(e) = writer.write_all(bytes).and_then(|_| writer.flush()) {
+            drop(writer);
             let _ = std::fs::remove_file(&tmp_path);
-            return Err(format!("Failed to write {}: {e}", tmp_path.display()));
+            return Err(format_file_save_error(&tmp_path, &e));
         }
+        let file = match writer.into_inner() {
+            Ok(f) => f,
+            Err(into_err) => {
+                let err = into_err.into_error();
+                let _ = std::fs::remove_file(&tmp_path);
+                return Err(format_file_save_error(&tmp_path, &err));
+            }
+        };
+        if let Err(e) = file.sync_all() {
+            drop(file);
+            let _ = std::fs::remove_file(&tmp_path);
+            return Err(format_file_save_error(&tmp_path, &e));
+        }
+        drop(file);
     }
 
     match std::fs::rename(&tmp_path, dest_path) {
         Ok(()) => Ok(()),
         Err(first_err) => {
-            if std::fs::remove_file(dest_path).is_ok()
-                && std::fs::rename(&tmp_path, dest_path).is_ok()
-            {
-                return Ok(());
+            if dest_path.exists() {
+                match std::fs::remove_file(dest_path) {
+                    Ok(()) => match std::fs::rename(&tmp_path, dest_path) {
+                        Ok(()) => return Ok(()),
+                        Err(rename_err) => {
+                            let _ = std::fs::remove_file(&tmp_path);
+                            return Err(format_file_save_error(dest_path, &rename_err));
+                        }
+                    },
+                    Err(remove_err) => {
+                        let _ = std::fs::remove_file(&tmp_path);
+                        return Err(format_file_save_error(dest_path, &remove_err));
+                    }
+                }
             }
             let _ = std::fs::remove_file(&tmp_path);
-            Err(format!(
-                "Failed to replace {}: {first_err}",
-                dest_path.display()
-            ))
+            Err(format_file_save_error(dest_path, &first_err))
         }
     }
 }
@@ -3489,12 +3581,28 @@ fn unique_batch_output_paths(files: &[PdfFileItem], folder: &Path) -> Vec<PathBu
     let mut paths = Vec::with_capacity(files.len());
 
     for item in files {
-        let stem = item_output_stem(item);
-        let suffix = item.settings.suffix.as_str();
-        let mut candidate = formatted_output_filename(&stem, suffix);
+        let source_path = item
+            .path
+            .as_deref()
+            .unwrap_or_else(|| Path::new(&item.file_name));
+        let base_out = build_output_path(source_path, &item.settings.suffix);
+        let base_name = base_out
+            .file_name()
+            .and_then(|s| s.to_str())
+            .filter(|s| !s.is_empty())
+            .unwrap_or("output.pdf")
+            .to_string();
+        let base_stem = base_out
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .filter(|s| !s.is_empty())
+            .unwrap_or("output")
+            .to_string();
+
+        let mut candidate = base_name;
         let mut n = 2usize;
         while !used.insert(candidate.to_lowercase()) {
-            candidate = format!("{stem}{suffix}_{n}.pdf");
+            candidate = format!("{base_stem}_{n}.pdf");
             n += 1;
         }
         paths.push(folder.join(candidate));
@@ -5229,6 +5337,29 @@ mod tests {
             cd_app.files[0].settings.options.color_depth,
             ColorDepth::TrueColor24,
             "switching from JPEG 2000 HDR 30-bit to JPG must auto-fallback to True Color (24-bit)"
+        );
+    }
+
+    #[test]
+    fn build_output_path_sanitizes_suffix_and_preserves_original_when_blank() {
+        let input = Path::new(r"C:\docs\report.pdf");
+        assert_eq!(
+            build_output_path(input, "-compressed"),
+            PathBuf::from(r"C:\docs\report-compressed.pdf")
+        );
+        assert_eq!(
+            build_output_path(input, ""),
+            PathBuf::from(r"C:\docs\report.pdf")
+        );
+        // Forbidden Windows chars + ASCII controls + trailing spaces/dots are stripped cleanly.
+        assert_eq!(
+            build_output_path(input, "-v2:*/?\\<>|\x07 . . "),
+            PathBuf::from(r"C:\docs\report-v2.pdf")
+        );
+        // Suffix containing only forbidden chars, dots, or spaces collapses to exact original name.
+        assert_eq!(
+            build_output_path(input, " :*?\"<>| ...  "),
+            PathBuf::from(r"C:\docs\report.pdf")
         );
     }
 }

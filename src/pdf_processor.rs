@@ -31,14 +31,22 @@ use crate::jpx_enc::{
     encode_jpx_bilevel_1bit, encode_jpx_gray, encode_jpx_rgb, encode_jpx_rgb_10bit,
 };
 
-static WORKER_POOL: OnceLock<rayon::ThreadPool> = OnceLock::new();
+static WORKER_POOL: OnceLock<Option<rayon::ThreadPool>> = OnceLock::new();
 
-/// Caps background CPU worker threads to 50% of logical cores (clamped to `1..=4`)
-/// so compression never starves the GUI or other running applications.
+/// Caps background CPU worker threads to 50% of logical cores (clamped to `1..=3`)
+/// so compression never spikes CPU usage or starves the GUI/OS.
 pub fn worker_thread_count() -> usize {
-    std::thread::available_parallelism()
-        .map(|n| (n.get() / 2).clamp(1, 4))
+    (std::thread::available_parallelism()
+        .map(|n| n.get())
         .unwrap_or(2)
+        / 2)
+        .clamp(1, 3)
+}
+
+#[inline]
+fn cooperative_cpu_pace() {
+    std::thread::yield_now();
+    std::thread::sleep(std::time::Duration::from_millis(2));
 }
 
 #[cfg(windows)]
@@ -70,25 +78,27 @@ pub(crate) fn set_current_thread_below_normal() {
 #[cfg(not(any(windows, unix)))]
 pub(crate) fn set_current_thread_below_normal() {}
 
-fn worker_pool() -> &'static rayon::ThreadPool {
+fn worker_pool() -> Option<&'static rayon::ThreadPool> {
     const WORKER_STACK_BYTES: usize = 8 * 1024 * 1024;
-    WORKER_POOL.get_or_init(|| {
-        let threads = worker_thread_count();
-        rayon::ThreadPoolBuilder::new()
-            .num_threads(threads)
-            .stack_size(WORKER_STACK_BYTES)
-            .thread_name(|idx| format!("pdf-worker-{idx}"))
-            .start_handler(|_| set_current_thread_below_normal())
-            .build()
-            .unwrap_or_else(|_| {
-                rayon::ThreadPoolBuilder::new()
-                    .num_threads(1)
-                    .stack_size(WORKER_STACK_BYTES)
-                    .start_handler(|_| set_current_thread_below_normal())
-                    .build()
-                    .expect("failed to construct fallback rayon thread pool")
-            })
-    })
+    WORKER_POOL
+        .get_or_init(|| {
+            let threads = worker_thread_count();
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .stack_size(WORKER_STACK_BYTES)
+                .thread_name(|idx| format!("pdf-worker-{idx}"))
+                .start_handler(|_| set_current_thread_below_normal())
+                .build()
+                .or_else(|_| {
+                    rayon::ThreadPoolBuilder::new()
+                        .num_threads(1)
+                        .stack_size(WORKER_STACK_BYTES)
+                        .start_handler(|_| set_current_thread_below_normal())
+                        .build()
+                })
+                .ok()
+        })
+        .as_ref()
 }
 
 /// Maximum uncompressed stream size (256 MiB) per image layer to guard against corrupt streams.
@@ -1398,8 +1408,9 @@ type InitialDedupEntry = (ObjectId, [u8; 16], u8, usize, Option<CachedStreamPayl
 fn deduplicate_objects_iterative(doc: &mut Document, parallel: bool) -> usize {
     let mut total_merged = 0usize;
 
-    let initial: Vec<InitialDedupEntry> = if parallel {
-        worker_pool().install(|| {
+    let initial: Vec<InitialDedupEntry> = if let Some(pool) = if parallel { worker_pool() } else { None }
+    {
+        pool.install(|| {
             let doc_ref = &*doc;
             doc.objects
                 .par_iter()
@@ -1612,7 +1623,8 @@ fn recompress_flate_and_raw_streams(doc: &mut Document, parallel: bool) -> usize
         .collect();
 
     let mut updated_count = 0usize;
-    if !parallel {
+    let pool_opt = if parallel { worker_pool() } else { None };
+    let Some(pool) = pool_opt else {
         let mut scratch = FlateScratch::default();
         for (id, is_flate) in candidates {
             if let Some((oid, compressed, add_filter)) =
@@ -1624,11 +1636,12 @@ fn recompress_flate_and_raw_streams(doc: &mut Document, parallel: bool) -> usize
             }
         }
         return updated_count;
-    }
+    };
 
-    let chunk_size = worker_thread_count().max(1);
-    for chunk in candidates.chunks(chunk_size) {
-        let updates: Vec<(ObjectId, Vec<u8>, bool)> = worker_pool().install(|| {
+    let chunk_size = pool.current_num_threads().max(1);
+    let total_chunks = candidates.len().div_ceil(chunk_size);
+    for (chunk_idx, chunk) in candidates.chunks(chunk_size).enumerate() {
+        let updates: Vec<(ObjectId, Vec<u8>, bool)> = pool.install(|| {
             let doc_ref = &*doc;
             chunk
                 .par_iter()
@@ -1643,6 +1656,9 @@ fn recompress_flate_and_raw_streams(doc: &mut Document, parallel: bool) -> usize
             if apply_recompressed_flate_update(doc, id, compressed, add_filter) {
                 updated_count += 1;
             }
+        }
+        if chunk_idx + 1 < total_chunks {
+            cooperative_cpu_pace();
         }
     }
 
@@ -2585,29 +2601,15 @@ fn compress_document_with_mode(
 
     let mut processed_smasks: HashSet<ObjectId> = HashSet::new();
 
-    if !parallel {
-        let mut scratch = ImageEncodeScratch::default();
-        for job in &jobs {
-            let outcome = process_single_image_job_with_mode(
-                &doc,
-                job,
-                scale,
-                filter_type,
-                options.format,
-                options.color_depth,
-                quality,
-                false,
-                &mut scratch,
-            )?;
-            apply_image_compression_outcome(&mut doc, outcome, &mut stats, &mut processed_smasks);
-        }
-    } else {
+    let pool_opt = if parallel { worker_pool() } else { None };
+    if let Some(pool) = pool_opt {
         let processed_count = AtomicUsize::new(0);
         let progress_lock = Mutex::new(&mut *on_progress);
-        let chunk_size = worker_thread_count().max(1);
+        let chunk_size = pool.current_num_threads().max(1);
+        let total_chunks = jobs.len().div_ceil(chunk_size);
 
-        for job_chunk in jobs.chunks(chunk_size) {
-            let outcomes: Vec<Result<ImageCompressionOutcome, PdfError>> = worker_pool().install(|| {
+        for (chunk_idx, job_chunk) in jobs.chunks(chunk_size).enumerate() {
+            let outcomes: Vec<Result<ImageCompressionOutcome, PdfError>> = pool.install(|| {
                 let doc_ref = &doc;
                 job_chunk
                     .par_iter()
@@ -2638,6 +2640,25 @@ fn compress_document_with_mode(
             for res in outcomes {
                 apply_image_compression_outcome(&mut doc, res?, &mut stats, &mut processed_smasks);
             }
+            if chunk_idx + 1 < total_chunks {
+                cooperative_cpu_pace();
+            }
+        }
+    } else {
+        let mut scratch = ImageEncodeScratch::default();
+        for job in &jobs {
+            let outcome = process_single_image_job_with_mode(
+                &doc,
+                job,
+                scale,
+                filter_type,
+                options.format,
+                options.color_depth,
+                quality,
+                false,
+                &mut scratch,
+            )?;
+            apply_image_compression_outcome(&mut doc, outcome, &mut stats, &mut processed_smasks);
         }
     }
 
@@ -4123,7 +4144,11 @@ fn encode_for_pdf_with_mode(
     let effective_depth = color_depth.fallback_for(format);
     match format {
         ImageFormatChoice::Jpeg => {
-            encode_jpeg_stream_with_mode(image, width, height, quality, preview_fast)
+            if width < 8 || height < 8 {
+                encode_pdf_flate_lossless_with_mode(image, width, height, preview_fast, scratch)
+            } else {
+                encode_jpeg_stream_with_mode(image, width, height, quality, preview_fast)
+            }
         }
         ImageFormatChoice::Jpeg2000 => {
             encode_jpx_stream_with_mode(image, width, height, effective_depth, quality)
@@ -7618,7 +7643,7 @@ mod tests {
     #[test]
     fn worker_pool_bounds_and_per_page_preview_extraction_work_accurately() {
         let threads = worker_thread_count();
-        assert!((1..=4).contains(&threads));
+        assert!((1..=3).contains(&threads));
 
         // Build a 3-page PDF:
         // Page 1: small 32x32 icon + primary 120x80 RGB image (must pick 120x80)

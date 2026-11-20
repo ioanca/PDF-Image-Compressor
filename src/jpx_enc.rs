@@ -1493,7 +1493,18 @@ fn encode_jpx_components(
     use_mct: bool,
     bit_depth: u8,
 ) -> Result<Vec<u8>, String> {
+    if !matches!(bit_depth, 1 | 8 | 10) {
+        return Err(cold_jpx_err(format!(
+            "Unsupported JPEG 2000 bit depth {bit_depth} (supported: 1, 8, 10)."
+        )));
+    }
+    let quality = quality.clamp(1, 100);
     let num_comps = components.len();
+    if num_comps == 0 || (use_mct && num_comps != 3) {
+        return Err(cold_jpx_err(format!(
+            "Invalid JPEG 2000 component count {num_comps} (use_mct={use_mct})."
+        )));
+    }
     // Single precinct per resolution requires width/height <= 16384; clamp decompositions safely.
     let n_l = (width.min(height).max(1).ilog2() as u8).min(MAX_DECOMP_LEVELS);
     let depth_scale = 2.0_f32.powi((bit_depth as i32) - (BIT_DEPTH as i32));

@@ -45,36 +45,48 @@ fn panic_payload_message(payload: Box<dyn std::any::Any + Send>) -> String {
         .to_string()
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_mozjpeg_pass(
     pixels: &[u8],
     width: u32,
     height: u32,
     color_space: ColorSpace,
+    channels: usize,
     quality: u8,
     progressive: bool,
     optimize_scans: bool,
+    fast_safe: bool,
 ) -> Result<Vec<u8>, String> {
+    let is_rgb = color_space == ColorSpace::JCS_RGB && channels == 3;
+    let use_opt_scans = optimize_scans && is_rgb && !fast_safe;
+
     // MozJPEG reports internal libjpeg errors by unwinding through C frames.
     let result =
         std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> Result<Vec<u8>, String> {
             let mut comp = Compress::new(color_space);
-            // Must come first: set_scan_optimization_mode resets defaults to JCP_MAX_COMPRESSION
-            // (trellis quantization + overshoot deringing + progressive scan optimization).
-            if optimize_scans {
+            if fast_safe {
+                // Disables trellis quantization and multi-scan optimization which can trigger
+                // C-level DCT/Huffman faults at Q=100 or on tiny strip dimensions (<8 px).
+                comp.set_fastest_defaults();
+            } else if use_opt_scans {
+                // Must come first: set_scan_optimization_mode resets defaults to JCP_MAX_COMPRESSION
+                // (trellis quantization + overshoot deringing + progressive scan optimization).
                 comp.set_scan_optimization_mode(ScanMode::AllComponentsTogether);
             }
             comp.set_size(width as usize, height as usize);
             comp.set_quality(f32::from(quality));
-            comp.set_optimize_scans(optimize_scans);
-            if !optimize_scans {
+            comp.set_optimize_scans(use_opt_scans);
+            if !use_opt_scans {
                 comp.set_use_scans_in_trellis(false);
             }
-            if progressive {
+            if progressive && !fast_safe {
                 comp.set_progressive_mode();
             }
             comp.set_optimize_coding(true);
 
-            if color_space == ColorSpace::JCS_RGB {
+            // Never configure chroma subsampling on 1-channel grayscale images; only RGB (3 components)
+            // has Cb/Cr planes (indices 1 and 2).
+            if is_rgb {
                 if quality <= CHROMA_444_QUALITY_THRESHOLD {
                     comp.set_chroma_sampling_pixel_sizes((2, 2), (2, 2)); // 4:2:0
                 } else {
@@ -111,15 +123,68 @@ fn encode_mozjpeg(
     quality: u8,
 ) -> Result<Vec<u8>, String> {
     validate_dims(width, height, channels, pixels.len())?;
-    let clamped_q = quality.clamp(1, 100);
+    let small_strip = width < 8 || height < 8;
+    let clamped_q = if small_strip {
+        quality.clamp(1, 95)
+    } else {
+        quality.clamp(1, 100)
+    };
+
+    // At Q>=98 (including Q=100) or sub-block strips (<8px), bypass MozJPEG's trellis/scan-opt
+    // progressive passes to avoid C-level Huffman/DCT faults and excessive CPU overhead.
+    if small_strip || clamped_q >= 98 {
+        return run_mozjpeg_pass(
+            pixels,
+            width,
+            height,
+            color_space,
+            channels,
+            clamped_q,
+            false,
+            false,
+            true,
+        );
+    }
 
     // Try progressive scan optimization first; fall back without scan optimization or
     // progressive scans if MozJPEG hits an internal Huffman table error on sparse inputs.
-    run_mozjpeg_pass(pixels, width, height, color_space, clamped_q, true, true)
-        .or_else(|_| run_mozjpeg_pass(pixels, width, height, color_space, clamped_q, true, false))
-        .or_else(|_| {
-            run_mozjpeg_pass(pixels, width, height, color_space, clamped_q, false, false)
-        })
+    run_mozjpeg_pass(
+        pixels,
+        width,
+        height,
+        color_space,
+        channels,
+        clamped_q,
+        true,
+        true,
+        false,
+    )
+    .or_else(|_| {
+        run_mozjpeg_pass(
+            pixels,
+            width,
+            height,
+            color_space,
+            channels,
+            clamped_q,
+            true,
+            false,
+            false,
+        )
+    })
+    .or_else(|_| {
+        run_mozjpeg_pass(
+            pixels,
+            width,
+            height,
+            color_space,
+            channels,
+            clamped_q,
+            false,
+            false,
+            true,
+        )
+    })
 }
 
 /// Encodes an 8-bit grayscale (`L8`) buffer as a MozJPEG stream with trellis
@@ -154,43 +219,24 @@ fn encode_mozjpeg_fast_preview(
     quality: u8,
 ) -> Result<Vec<u8>, String> {
     validate_dims(width, height, channels, pixels.len())?;
-    let clamped_q = quality.clamp(1, 100);
+    let small_strip = width < 8 || height < 8;
+    let clamped_q = if small_strip {
+        quality.clamp(1, 95)
+    } else {
+        quality.clamp(1, 100)
+    };
 
-    let result =
-        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> Result<Vec<u8>, String> {
-            let mut comp = Compress::new(color_space);
-            comp.set_fastest_defaults();
-            comp.set_size(width as usize, height as usize);
-            comp.set_quality(f32::from(clamped_q));
-            comp.set_optimize_scans(false);
-            comp.set_optimize_coding(true);
-
-            if color_space == ColorSpace::JCS_RGB {
-                if clamped_q <= CHROMA_444_QUALITY_THRESHOLD {
-                    comp.set_chroma_sampling_pixel_sizes((2, 2), (2, 2)); // 4:2:0
-                } else {
-                    comp.set_chroma_sampling_pixel_sizes((1, 1), (1, 1)); // 4:4:4
-                }
-            }
-
-            let mut started = comp
-                .start_compress(Vec::new())
-                .map_err(|e| format!("MozJPEG fast preview start_compress failed: {e}"))?;
-            started
-                .write_scanlines(pixels)
-                .map_err(|e| format!("MozJPEG fast preview write_scanlines failed: {e}"))?;
-            started
-                .finish()
-                .map_err(|e| format!("MozJPEG fast preview finish failed: {e}"))
-        }));
-
-    match result {
-        Ok(inner) => inner,
-        Err(payload) => Err(format!(
-            "MozJPEG panicked during fast preview encoding: {}",
-            panic_payload_message(payload)
-        )),
-    }
+    run_mozjpeg_pass(
+        pixels,
+        width,
+        height,
+        color_space,
+        channels,
+        clamped_q,
+        false,
+        false,
+        true,
+    )
     .or_else(|_| encode_mozjpeg(pixels, width, height, color_space, channels, clamped_q))
 }
 
@@ -579,6 +625,43 @@ mod tests {
                 .expect("decode fast sparse rgb")
                 .to_rgb8();
             assert_eq!(dec_fast.dimensions(), (w, h));
+        }
+    }
+
+    #[test]
+    fn encodes_grayscale_and_narrow_strips_at_q100_without_crash() {
+        // Grayscale Luma8 at Q=100 (> 85) must never touch chroma subsampling factors.
+        let gray_64: Vec<u8> = (0..(64 * 64)).map(|i| ((i * 13) % 256) as u8).collect();
+        let enc_gray = encode_jpeg_gray(&gray_64, 64, 64, 100).expect("gray 64x64 Q100");
+        assert_eq!(
+            decode_jpeg_to_image(&enc_gray)
+                .expect("decode gray Q100")
+                .to_luma8()
+                .dimensions(),
+            (64, 64)
+        );
+
+        // Odd/strip dimensions (< 8px on either axis) at Q=100 for both grayscale and RGB.
+        for (w, h) in [(1u32, 64u32), (64, 1), (3, 37), (37, 3), (1, 1)] {
+            let g = vec![180u8; (w * h) as usize];
+            let enc_g = encode_jpeg_gray(&g, w, h, 100).expect("strip gray Q100");
+            assert_eq!(
+                decode_jpeg_to_image(&enc_g)
+                    .expect("decode strip gray Q100")
+                    .to_luma8()
+                    .dimensions(),
+                (w, h)
+            );
+
+            let rgb = vec![120u8; (w * h * 3) as usize];
+            let enc_rgb = encode_jpeg_rgb(&rgb, w, h, 100).expect("strip rgb Q100");
+            assert_eq!(
+                decode_jpeg_to_image(&enc_rgb)
+                    .expect("decode strip rgb Q100")
+                    .to_rgb8()
+                    .dimensions(),
+                (w, h)
+            );
         }
     }
 }
